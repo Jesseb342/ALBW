@@ -1,1 +1,220 @@
+name: Ghidra ALBW IPC wrappers
+
+on:
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Restore Ghidra project cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ghproj
+          key: ghproj-albw-v1
+          fail-on-cache-miss: true
+
+      - name: Download Ghidra (latest release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl tools
+          gh release download --repo NationalSecurityAgency/ghidra \
+            --pattern 'ghidra_*_PUBLIC_*.zip' --dir dl
+          unzip -q dl/*.zip -d tools
+
+      - name: Write report script
+        run: |
+          mkdir -p ghidra_scripts reports
+          cat > ghidra_scripts/IpcWrappers.java <<'JAVA'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.lang.Register;
+          import ghidra.program.model.listing.*;
+          import ghidra.program.model.mem.Memory;
+          import ghidra.program.model.scalar.Scalar;
+          import ghidra.program.model.symbol.Reference;
+          import java.io.*;
+          import java.util.*;
+
+          public class IpcWrappers extends GhidraScript {
+            static final long DATA_LO = 0x6ff000L;
+            static final long DATA_HI = 0x7af434L;
+            Memory mem;
+
+            static String hex8(long v) { return String.format("0x%08x", v); }
+
+            Long literalValue(Instruction ins) {
+              for (Reference r : ins.getReferencesFrom()) {
+                if (!r.isMemoryReference()) continue;
+                try {
+                  return Long.valueOf(mem.getInt(r.getToAddress(), false) & 0xFFFFFFFFL);
+                } catch (Exception e) { }
+              }
+              return null;
+            }
+
+            @Override
+            public void run() throws Exception {
+              mem = currentProgram.getMemory();
+              FunctionManager fm = currentProgram.getFunctionManager();
+              Listing listing = currentProgram.getListing();
+              String dir = System.getenv("REPORT_DIR");
+              if (dir == null) dir = "reports";
+              new File(dir).mkdirs();
+
+              PrintWriter w = new PrintWriter(new FileWriter(dir + "/ipc_wrappers.txt"));
+              TreeMap<Long, TreeMap<String, String>> byHandle = new TreeMap<>();
+              int resolved = 0;
+              int unresolved = 0;
+
+              InstructionIterator it = listing.getInstructions(true);
+              while (it.hasNext()) {
+                Instruction svcIns = it.next();
+                String m = svcIns.getMnemonicString().toLowerCase();
+                if (!(m.startsWith("svc") || m.startsWith("swi"))) continue;
+                Scalar s = svcIns.getScalar(0);
+                if (s == null || s.getUnsignedValue() != 0x32L) continue;
+                Function f = fm.getFunctionContaining(svcIns.getAddress());
+                if (f == null) {
+                  w.println(svcIns.getAddress() + " (no function)");
+                  unresolved++;
+                  continue;
+                }
+
+                Map<String, Long> regs = new HashMap<>();
+                String tls = null;
+                boolean headerDone = false;
+                Long header = null;
+                Long handle = null;
+
+                InstructionIterator fi = listing.getInstructions(f.getBody(), true);
+                while (fi.hasNext()) {
+                  Instruction x = fi.next();
+                  if (x.getAddress().compareTo(svcIns.getAddress()) >= 0) break;
+                  String xm = x.getMnemonicString().toLowerCase();
+
+                  if (xm.equals("mrc")) {
+                    String r = null;
+                    for (int i = 0; i < x.getNumOperands(); i++) {
+                      Register rg = x.getRegister(i);
+                      if (rg != null && rg.getName().matches("r\\d+")) { r = rg.getName(); break; }
+                    }
+                    if (r != null) {
+                      tls = r;
+                      headerDone = false;
+                      header = null;
+                      handle = null;
+                      regs.clear();
+                    }
+                    continue;
+                  }
+
+                  if (xm.startsWith("ldr")) {
+                    Register d = x.getRegister(0);
+                    Long v = literalValue(x);
+                    if (d != null) {
+                      if (v != null) {
+                        regs.put(d.getName(), v);
+                        if (v.longValue() >= DATA_LO && v.longValue() < DATA_HI) handle = v;
+                      } else {
+                        regs.remove(d.getName());
+                      }
+                    }
+                  } else if (xm.equals("mov") || xm.equals("cpy")) {
+                    Register d = x.getRegister(0);
+                    if (d != null) {
+                      Scalar sc = x.getScalar(1);
+                      Register sr = x.getRegister(1);
+                      if (sc != null) {
+                        regs.put(d.getName(), Long.valueOf(sc.getUnsignedValue()));
+                      } else if (sr != null && regs.containsKey(sr.getName())) {
+                        regs.put(d.getName(), regs.get(sr.getName()));
+                      } else {
+                        regs.remove(d.getName());
+                      }
+                    }
+                  } else if (xm.startsWith("str") && tls != null && !headerDone) {
+                    boolean base = false;
+                    for (int i = 1; i < x.getNumOperands(); i++) {
+                      for (Object o : x.getOpObjects(i)) {
+                        if (o instanceof Register && ((Register) o).getName().equals(tls)) base = true;
+                      }
+                    }
+                    Register src = x.getRegister(0);
+                    if (base && src != null) {
+                      header = regs.get(src.getName());
+                      headerDone = true;
+                    }
+                  }
+                }
+
+                String cmdStr = "?";
+                String key = "?";
+                if (header != null) {
+                  long h = header.longValue();
+                  key = hex8(h);
+                  cmdStr = hex8(h) + " cmd=0x" + Long.toHexString(h >>> 16)
+                    + " n=" + ((h >>> 6) & 0x3F) + " t=" + (h & 0x3F);
+                }
+                String hs = (handle == null) ? "?" : hex8(handle.longValue());
+                w.println(svcIns.getAddress() + " " + f.getName() + " hdr=" + cmdStr + " handle=" + hs);
+
+                if (header == null || handle == null) unresolved++; else resolved++;
+                if (handle != null) {
+                  TreeMap<String, String> cmds = byHandle.get(handle);
+                  if (cmds == null) {
+                    cmds = new TreeMap<String, String>();
+                    byHandle.put(handle, cmds);
+                  }
+                  cmds.put(key, f.getName());
+                }
+              }
+              w.close();
+
+              PrintWriter g = new PrintWriter(new FileWriter(dir + "/ipc_by_handle.txt"));
+              g.println("resolved=" + resolved + " unresolved=" + unresolved);
+              for (Map.Entry<Long, TreeMap<String, String>> e : byHandle.entrySet()) {
+                g.println("handle global " + hex8(e.getKey().longValue()) + " : "
+                  + e.getValue().size() + " commands");
+                for (Map.Entry<String, String> c : e.getValue().entrySet()) {
+                  g.println("   " + c.getKey() + "  " + c.getValue());
+                }
+              }
+              g.close();
+            }
+          }
+          JAVA
+
+      - name: Run report script
+        run: |
+          set -euo pipefail
+          GH="$(find tools -maxdepth 1 -type d -name 'ghidra_*' | head -n 1)"
+          export REPORT_DIR="$PWD/reports"
+          "$GH/support/analyzeHeadless" "$PWD/ghproj" ALBW \
+            -process baserom.elf \
+            -noanalysis \
+            -readOnly \
+            -scriptPath "$PWD/ghidra_scripts" \
+            -postScript IpcWrappers.java
+
+      - name: Show reports
+        run: |
+          echo "=== ipc_by_handle ==="
+          cat reports/ipc_by_handle.txt
+          echo "=== unresolved sites ==="
+          grep -E 'hdr=\?|handle=\?|no function' reports/ipc_wrappers.txt | head -40
+
+      - name: Upload reports (text only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: albw-ipc-wrappers
+          path: reports/*.txt
+          retention-days: 1
 
