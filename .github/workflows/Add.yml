@@ -1,0 +1,188 @@
+name: Ghidra ALBW census
+
+on:
+  workflow_dispatch:
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Restore Ghidra project cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ghproj
+          key: ghproj-albw-v1
+          fail-on-cache-miss: true
+
+      - name: Download Ghidra (latest release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl tools
+          gh release download --repo NationalSecurityAgency/ghidra \
+            --pattern 'ghidra_*_PUBLIC_*.zip' --dir dl
+          unzip -q dl/*.zip -d tools
+
+      - name: Write census script
+        run: |
+          mkdir -p ghidra_scripts reports
+          cat > ghidra_scripts/Census.java <<'JAVA'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.address.Address;
+          import ghidra.program.model.lang.Register;
+          import ghidra.program.model.lang.RegisterValue;
+          import ghidra.program.model.listing.*;
+          import ghidra.program.model.mem.MemoryBlock;
+          import ghidra.program.model.symbol.FlowType;
+          import java.io.*;
+          import java.util.*;
+          import java.util.regex.*;
+
+          public class Census extends GhidraScript {
+            static final Pattern PC_DEST = Pattern.compile("^(ldr|add|sub|mov|cpy|orr|and)\\w*\\s+pc,.*");
+            static final Pattern BX_REG = Pattern.compile("^bx\\w*\\s+(\\w+)$");
+            static final Pattern BLX_REG = Pattern.compile("^blx\\w*\\s+(\\w+)$");
+            static final Pattern REGN = Pattern.compile("\\br(1[0-2]|[0-9])\\b");
+            static final String[] COPROC = {"mcr", "mrc", "cdp", "ldc", "stc"};
+            static final String[] SPECIAL = {"ldrex", "strex", "clrex", "swp", "mrs", "msr",
+              "bkpt", "udf", "cps", "wfe", "wfi", "yield", "pld", "srs", "rfe", "smc",
+              "dmb", "dsb", "isb", "svc", "swi"};
+
+            static void bump(Map<String, Integer> m, String k) { m.merge(k, 1, Integer::sum); }
+
+            static List<Map.Entry<String, Integer>> sorted(Map<String, Integer> m) {
+              List<Map.Entry<String, Integer>> l = new ArrayList<>(m.entrySet());
+              l.sort((a, b) -> b.getValue() - a.getValue());
+              return l;
+            }
+
+            boolean isThumb(Register tm, Address a) {
+              if (tm == null) return false;
+              RegisterValue rv = currentProgram.getProgramContext().getRegisterValue(tm, a);
+              return rv != null && rv.hasValue() && rv.getUnsignedValue().intValue() == 1;
+            }
+
+            @Override
+            public void run() throws Exception {
+              String dir = System.getenv("REPORT_DIR");
+              if (dir == null) dir = "reports";
+              new File(dir).mkdirs();
+              Listing listing = currentProgram.getListing();
+              FunctionManager fm = currentProgram.getFunctionManager();
+              Register tmode = currentProgram.getLanguage().getRegister("TMode");
+
+              long total = 0, thumb = 0, instrBytes = 0, direct = 0;
+              Map<String, Integer> mn = new HashMap<>();
+              Map<String, Integer> flow = new HashMap<>();
+              Map<String, Integer> cat = new HashMap<>();
+              Map<String, Integer> cop = new HashMap<>();
+              Map<String, Integer> vfp = new HashMap<>();
+              Map<String, Integer> spec = new HashMap<>();
+              Map<String, Integer> perFunc = new HashMap<>();
+
+              PrintWriter sites = new PrintWriter(new FileWriter(dir + "/indirect_sites.txt"));
+              int siteLines = 0;
+
+              InstructionIterator it = listing.getInstructions(true);
+              while (it.hasNext()) {
+                Instruction x = it.next();
+                total++;
+                instrBytes += x.getLength();
+                boolean th = isThumb(tmode, x.getAddress());
+                if (th) thumb++;
+                String m = x.getMnemonicString().toLowerCase();
+                bump(mn, m);
+                String t = x.toString().toLowerCase().trim();
+                FlowType ft = x.getFlowType();
+                if (ft.isCall() && !ft.isComputed()) direct++;
+                if (ft.isComputed()) {
+                  bump(flow, (ft.isCall() ? "call " : "") + (ft.isJump() ? "jump " : "")
+                    + (ft.isTerminal() ? "terminal" : "non-terminal"));
+                }
+
+                for (String c : COPROC) {
+                  if (m.startsWith(c)) {
+                    bump(cop, REGN.matcher(t).replaceAll("rN"));
+                    break;
+                  }
+                }
+                if (m.startsWith("v")) {
+                  int dot = m.indexOf('.');
+                  bump(vfp, dot > 0 ? m.substring(0, dot) : m);
+                }
+                for (String s : SPECIAL) {
+                  if (m.startsWith(s)) { bump(spec, s); break; }
+                }
+
+                String category = null;
+                Matcher mm;
+                if ((mm = BX_REG.matcher(t)).matches()) {
+                  category = mm.group(1).equals("lr") ? "bx lr (return)" : "bx reg (indirect jump)";
+                } else if (BLX_REG.matcher(t).matches()) {
+                  category = "blx reg (indirect call)";
+                } else if (PC_DEST.matcher(t).matches()) {
+                  if (t.contains("[sp") || t.matches("^(mov|cpy)\\w*\\s+pc,lr.*")) {
+                    category = "return via pc write";
+                  } else if (t.startsWith("add") && t.contains("pc,pc")) {
+                    category = "jump table: add pc,pc";
+                  } else if (t.startsWith("ldr") && t.contains("[pc")) {
+                    category = "jump table: ldr pc,[pc,..]";
+                  } else {
+                    category = "other write to pc";
+                  }
+                }
+                if (category != null) {
+                  bump(cat, category);
+                  if (!category.contains("return")) {
+                    Function f = fm.getFunctionContaining(x.getAddress());
+                    String fn = f == null ? "-" : f.getName();
+                    bump(perFunc, fn);
+                    if (siteLines < 6000) {
+                      sites.println(x.getAddress() + " " + (th ? "T" : "A") + " " + fn
+                        + " | " + category + " | " + t);
+                      siteLines++;
+                    }
+                  }
+                }
+              }
+              sites.close();
+
+              long thumbFuncs = 0, funcs = 0;
+              FunctionIterator fi = fm.getFunctions(true);
+              while (fi.hasNext()) {
+                Function f = fi.next();
+                funcs++;
+                if (isThumb(tmode, f.getEntryPoint())) thumbFuncs++;
+              }
+
+              MemoryBlock text = currentProgram.getMemory().getBlock(".text");
+              long dataBytes = 0;
+              if (text != null) {
+                DataIterator di = listing.getDefinedData(text.getStart(), true);
+                while (di.hasNext()) {
+                  Data d = di.next();
+                  if (!text.contains(d.getAddress())) break;
+                  dataBytes += d.getLength();
+                }
+              }
+
+              PrintWriter w = new PrintWriter(new FileWriter(dir + "/census_summary.txt"));
+              w.println("instructions: " + total + " (thumb: " + thumb + ", arm: " + (total - thumb) + ")");
+              w.println("functions: " + funcs + " (thumb entry: " + thumbFuncs + ")");
+              w.println("direct calls (bl/blx imm): " + direct);
+              if (text != null) {
+                long size = text.getSize();
+                w.println(".text size: " + size + " bytes, instruction bytes: " + instrBytes
+                  + ", defined data bytes: " + dataBytes
+                  + ", undefined/other: " + (size - instrBytes - dataBytes));
+              }
+              w.println("--- computed flow (Ghidra's view) ---");
+              for (Map.Entry
+
