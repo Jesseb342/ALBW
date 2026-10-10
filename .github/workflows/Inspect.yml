@@ -15,9 +15,8 @@ jobs:
           curl -L --fail --retry 3 --retry-all-errors \
             -A "Mozilla/5.0" -o dump.bin "$ALBW_URL"
           ls -lh dump.bin
-          file dump.bin
 
-      - name: Inspect headers
+      - name: Inspect ExeFS and RomFS
         run: |
           python3 - <<'EOF'
           import struct
@@ -27,38 +26,38 @@ jobs:
               f.seek(o)
               return f.read(n)
 
-          def ncch(base):
-              magic = rd(base + 0x100, 4)
-              print('  NCCH magic:', magic)
-              if magic != b'NCCH':
-                  return
-              pid = struct.unpack('<Q', rd(base + 0x108, 8))[0]
-              print('  partition id: %016X' % pid)
-              print('  product code:', rd(base + 0x150, 16).rstrip(b'\0').decode('ascii', 'replace'))
-              flags = rd(base + 0x188, 8)
-              print('  flags:', flags.hex())
-              print('  NoCrypto set (decrypted):', bool(flags[7] & 4))
+          def u32(o):
+              return struct.unpack('<I', rd(o, 4))[0]
 
-          print('first 16 bytes:', rd(0, 16).hex())
-          print('magic at 0x0:  ', rd(0, 4))
-          print('magic at 0x100:', rd(0x100, 4))
+          base = u32(0x120) * 0x200
+          print('NCCH at', hex(base), rd(base + 0x100, 4))
+          print('flags:', rd(base + 0x188, 8).hex())
 
-          if rd(0, 4) == b'\x7fELF':
-              print('Format: ELF')
-          elif rd(0, 4) == b'3DSX':
-              print('Format: 3DSX')
-          elif rd(0x100, 4) == b'NCSD':
-              print('Format: NCSD (.cci / .3ds)')
-              for i in range(8):
-                  off, ln = struct.unpack('<II', rd(0x120 + i * 8, 8))
-                  if ln:
-                      print('partition', i, 'offset', hex(off * 0x200), 'size', hex(ln * 0x200))
-                      if i == 0:
-                          ncch(off * 0x200)
-          elif rd(0x100, 4) == b'NCCH':
-              print('Format: NCCH (.cxi / .app)')
-              ncch(0)
-          else:
-              hdr = struct.unpack('<I', rd(0, 4))[0]
-              print('Unknown or CIA? first u32 =', hex(hdr))
+          exefs_off = u32(base + 0x1A0) * 0x200
+          exefs_size = u32(base + 0x1A4) * 0x200
+          romfs_off = u32(base + 0x1B0) * 0x200
+          romfs_size = u32(base + 0x1B4) * 0x200
+          print('ExeFS offset', hex(base + exefs_off), 'size', hex(exefs_size))
+          print('RomFS offset', hex(base + romfs_off), 'size', hex(romfs_size))
+
+          # ExeFS header: 10 entries of name(8) offset(4) size(4)
+          print('--- ExeFS file table ---')
+          hdr = rd(base + exefs_off, 0xA0)
+          for i in range(10):
+              e = hdr[i * 16:(i + 1) * 16]
+              name = e[:8].rstrip(b'\0')
+              off, size = struct.unpack('<II', e[8:])
+              if name:
+                  print(repr(name), 'offset', hex(off), 'size', hex(size))
+          print('table is plain text:', all(
+              32 <= b < 127 or b == 0 for b in hdr[:8]))
+
+          # RomFS starts with an IVFC header if decrypted
+          print('--- RomFS magic ---')
+          print(rd(base + romfs_off, 4))
+
+          # Extended header begins with the app title if decrypted
+          print('--- ExHeader title ---')
+          print(rd(base + 0x200, 8))
           EOF
+
