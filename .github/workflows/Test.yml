@@ -1,0 +1,236 @@
+name: Ghidra ALBW IPC wrappers
+
+on:
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Restore Ghidra project cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ghproj
+          key: ghproj-albw-v1
+          fail-on-cache-miss: true
+
+      - name: Download Ghidra (latest release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl tools
+          gh release download --repo NationalSecurityAgency/ghidra \
+            --pattern 'ghidra_*_PUBLIC_*.zip' --dir dl
+          unzip -q dl/*.zip -d tools
+
+      - name: Write report script
+        run: |
+          mkdir -p ghidra_scripts reports
+          cat > ghidra_scripts/IpcWrappers.java <<'JAVA'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.listing.*;
+          import ghidra.program.model.mem.Memory;
+          import ghidra.program.model.scalar.Scalar;
+          import java.io.*;
+          import java.util.*;
+          import java.util.regex.*;
+
+          public class IpcWrappers extends GhidraScript {
+            static final long DATA_LO = 0x6ff000L;
+            static final long DATA_HI = 0x7af434L;
+            Memory mem;
+
+            static final Pattern MRC = Pattern.compile("^mrc\\s+p15,0x0,(\\w+),cr13,cr0,0x3");
+            static final Pattern LDR_POOL = Pattern.compile("^ldr\\s+(\\w+),\\[(0x[0-9a-f]+)\\]$");
+            static final Pattern LDR_REG = Pattern.compile("^ldr\\s+(\\w+),\\[(\\w+)(?:,#(-?0x[0-9a-f]+|-?\\d+))?\\]$");
+            static final Pattern MOV_IMM = Pattern.compile("^(?:mov|cpy)\\s+(\\w+),#(0x[0-9a-f]+|\\d+)$");
+            static final Pattern MOV_REG = Pattern.compile("^(?:mov|cpy)\\s+(\\w+),(\\w+)$");
+            static final Pattern ADD_IMM = Pattern.compile("^add\\s+(\\w+),(\\w+),#(0x[0-9a-f]+|\\d+)$");
+            static final Pattern STORE = Pattern.compile("^(?:str|strd)\\s+(\\w+)(?:,(\\w+))?,\\[(\\w+)(?:,#(-?0x[0-9a-f]+|-?\\d+))?\\](!?)$");
+
+            static String hex8(long v) { return String.format("0x%08x", v); }
+
+            static long num(String s) {
+              boolean neg = s.startsWith("-");
+              if (neg) s = s.substring(1);
+              long v = s.startsWith("0x") ? Long.parseLong(s.substring(2), 16) : Long.parseLong(s);
+              return neg ? -v : v;
+            }
+
+            Long pool(long addr) {
+              try {
+                return Long.valueOf(mem.getInt(toAddr(addr), false) & 0xFFFFFFFFL);
+              } catch (Exception e) {
+                return null;
+              }
+            }
+
+            @Override
+            public void run() throws Exception {
+              mem = currentProgram.getMemory();
+              FunctionManager fm = currentProgram.getFunctionManager();
+              Listing listing = currentProgram.getListing();
+              String dir = System.getenv("REPORT_DIR");
+              if (dir == null) dir = "reports";
+              new File(dir).mkdirs();
+
+              PrintWriter w = new PrintWriter(new FileWriter(dir + "/ipc_wrappers.txt"));
+              TreeMap<Long, TreeMap<String, List<String>>> byHandle = new TreeMap<>();
+              int resolved = 0;
+              int unresolved = 0;
+
+              InstructionIterator it = listing.getInstructions(true);
+              while (it.hasNext()) {
+                Instruction svcIns = it.next();
+                String sm = svcIns.getMnemonicString().toLowerCase();
+                if (!(sm.startsWith("svc") || sm.startsWith("swi"))) continue;
+                Scalar s = svcIns.getScalar(0);
+                if (s == null || s.getUnsignedValue() != 0x32L) continue;
+                Function f = fm.getFunctionContaining(svcIns.getAddress());
+                if (f == null) {
+                  w.println(svcIns.getAddress() + " (no function)");
+                  unresolved++;
+                  continue;
+                }
+
+                Map<String, Long> regs = new HashMap<>();
+                String tls = null;
+                long tlsOff = 0;
+                boolean hdrDone = false;
+                Long header = null;
+                Long handle = null;
+
+                InstructionIterator fi = listing.getInstructions(f.getBody(), true);
+                while (fi.hasNext()) {
+                  Instruction x = fi.next();
+                  if (x.getAddress().compareTo(svcIns.getAddress()) >= 0) break;
+                  String t = x.toString().toLowerCase().trim();
+                  Matcher m;
+
+                  if ((m = MRC.matcher(t)).find()) {
+                    tls = m.group(1);
+                    tlsOff = 0;
+                    hdrDone = false;
+                    header = null;
+                    handle = null;
+                    regs.clear();
+                  } else if ((m = LDR_POOL.matcher(t)).matches()) {
+                    Long v = pool(num(m.group(2)));
+                    if (v != null) regs.put(m.group(1), v); else regs.remove(m.group(1));
+                  } else if ((m = LDR_REG.matcher(t)).matches()) {
+                    String d = m.group(1);
+                    String b = m.group(2);
+                    long off = m.group(3) == null ? 0 : num(m.group(3));
+                    Long bv = regs.get(b);
+                    if (bv != null && off == 0 && bv.longValue() >= DATA_LO && bv.longValue() < DATA_HI) {
+                      handle = bv;
+                    }
+                    regs.remove(d);
+                  } else if ((m = MOV_IMM.matcher(t)).matches()) {
+                    regs.put(m.group(1), Long.valueOf(num(m.group(2))));
+                  } else if ((m = MOV_REG.matcher(t)).matches()) {
+                    Long v = regs.get(m.group(2));
+                    if (v != null) regs.put(m.group(1), v); else regs.remove(m.group(1));
+                  } else if ((m = ADD_IMM.matcher(t)).matches()) {
+                    String d = m.group(1);
+                    if (tls != null && d.equals(tls) && m.group(2).equals(tls)) {
+                      tlsOff += num(m.group(3));
+                    } else {
+                      regs.remove(d);
+                    }
+                  } else if ((m = STORE.matcher(t)).matches()) {
+                    String base = m.group(3);
+                    long disp = m.group(4) == null ? 0 : num(m.group(4));
+                    boolean wb = !m.group(5).isEmpty();
+                    if (tls != null && base.equals(tls)) {
+                      if (!hdrDone && tlsOff + disp == 0x80) {
+                        header = regs.get(m.group(1));
+                        hdrDone = true;
+                      }
+                      if (wb) tlsOff += disp;
+                    }
+                  }
+                }
+
+                String key = "?";
+                String desc = "?";
+                if (header != null) {
+                  long h = header.longValue();
+                  key = hex8(h);
+                  desc = hex8(h) + " cmd=0x" + Long.toHexString(h >>> 16)
+                    + " n=" + ((h >>> 6) & 0x3F) + " t=" + (h & 0x3F);
+                }
+                String hs = (handle == null) ? "?" : hex8(handle.longValue());
+                w.println(svcIns.getAddress() + " " + f.getName() + " hdr=" + desc + " handle=" + hs);
+
+                if (header == null) unresolved++; else resolved++;
+                long hk = (handle == null) ? -1L : handle.longValue();
+                TreeMap<String, List<String>> cmds = byHandle.get(hk);
+                if (cmds == null) {
+                  cmds = new TreeMap<String, List<String>>();
+                  byHandle.put(hk, cmds);
+                }
+                List<String> names = cmds.get(key);
+                if (names == null) {
+                  names = new ArrayList<String>();
+                  cmds.put(key, names);
+                }
+                names.add(f.getName());
+              }
+              w.close();
+
+              PrintWriter g = new PrintWriter(new FileWriter(dir + "/ipc_by_handle.txt"));
+              g.println("headers resolved=" + resolved + " unresolved=" + unresolved);
+              for (Map.Entry<Long, TreeMap<String, List<String>>> e : byHandle.entrySet()) {
+                long k = e.getKey().longValue();
+                g.println((k < 0 ? "handle from argument or unresolved" : "handle global " + hex8(k))
+                  + " : " + e.getValue().size() + " distinct headers");
+                for (Map.Entry<String, List<String>> c : e.getValue().entrySet()) {
+                  String hd = c.getKey();
+                  String note = "";
+                  if (!hd.equals("?")) {
+                    long h = Long.parseLong(hd.substring(2), 16);
+                    note = " cmd=0x" + Long.toHexString(h >>> 16)
+                      + " n=" + ((h >>> 6) & 0x3F) + " t=" + (h & 0x3F);
+                  }
+                  g.println("   " + hd + note + "  " + String.join(",", c.getValue()));
+                }
+              }
+              g.close();
+            }
+          }
+          JAVA
+
+      - name: Run report script
+        run: |
+          set -euo pipefail
+          GH="$(find tools -maxdepth 1 -type d -name 'ghidra_*' | head -n 1)"
+          export REPORT_DIR="$PWD/reports"
+          "$GH/support/analyzeHeadless" "$PWD/ghproj" ALBW \
+            -process baserom.elf \
+            -noanalysis \
+            -readOnly \
+            -scriptPath "$PWD/ghidra_scripts" \
+            -postScript IpcWrappers.java
+
+      - name: Show reports
+        run: |
+          echo "=== ipc_by_handle ==="
+          cat reports/ipc_by_handle.txt
+          echo "=== still unresolved headers ==="
+          grep -E 'hdr=\?|no function' reports/ipc_wrappers.txt | head -30
+
+      - name: Upload reports (text only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: albw-ipc-wrappers
+          path: reports/*.txt
+          retention-days: 1
+
