@@ -1,36 +1,243 @@
-# This is a basic workflow to help you get started with Actions
+name: Ghidra ALBW
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  analyze:
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    timeout-minutes: 180
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
-
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Download dump
+        env:
+          ALBW_URL: "https://drive.usercontent.google.com/download?id=1ypm1CGmbkAgkRBdLHvxhjJo-a3BYvTE2&export=download&confirm=t"
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          set -euo pipefail
+          curl -L --fail --retry 3 --retry-all-errors \
+            -A "Mozilla/5.0" -o dump.bin "$ALBW_URL"
+          ls -lh dump.bin
+
+      - name: Pull out .code
+        run: |
+          python3 - <<'EOF'
+          import struct
+          f = open('dump.bin', 'rb')
+          def rd(o, n):
+              f.seek(o)
+              return f.read(n)
+          def u32(o):
+              return struct.unpack('<I', rd(o, 4))[0]
+
+          base = u32(0x120) * 0x200
+          assert rd(base + 0x100, 4) == b'NCCH'
+          exefs = base + u32(base + 0x1A0) * 0x200
+          hdr = rd(exefs, 0xA0)
+          code_off = code_size = None
+          for i in range(10):
+              e = hdr[i * 16:(i + 1) * 16]
+              if e[:8].rstrip(b'\0') == b'.code':
+                  code_off, code_size = struct.unpack('<II', e[8:])
+          assert code_size == 0x628000, hex(code_size)
+          code = rd(exefs + 0x200 + code_off, code_size)
+          print('first word:', hex(struct.unpack_from('<I', code, 0)[0]))
+          assert struct.unpack_from('<I', code, 0)[0] == 0xEB000007
+          open('code.bin', 'wb').write(code)
+          print('wrote code.bin', len(code))
+          EOF
+          rm dump.bin
+
+      - name: Build baserom.elf
+        run: |
+          python3 - <<'EOF'
+          import struct
+          code = open('code.bin', 'rb').read()
+          TEXT_ADDR, TEXT_SZ = 0x100000, 0x59211C
+          RO_ADDR, RO_SZ = 0x693000, 0x6B5F8
+          DATA_ADDR, DATA_SZ = 0x6FF000, 0x289F0
+          BSS_SZ = 0x87A44
+          BASE_OFF = 0x1000
+
+          def off(a):
+              return BASE_OFF + (a - TEXT_ADDR)
+
+          bss_addr = DATA_ADDR + DATA_SZ
+          shstr = b'\0.text\0.rodata\0.data\0.bss\0.shstrtab\0'
+          n_text, n_ro, n_data, n_bss, n_shstr = 1, 7, 15, 21, 26
+
+          shstr_off = BASE_OFF + len(code)
+          shoff = (shstr_off + len(shstr) + 3) & ~3
+
+          ident = b'\x7fELF' + bytes([1, 1, 1, 0]) + bytes(8)
+          ehdr = struct.pack('<16sHHIIIIIHHHHHH', ident, 2, 40, 1,
+                             TEXT_ADDR, 52, shoff, 0x05000000,
+                             52, 32, 3, 40, 6, 5)
+          ph = b''
+          ph += struct.pack('<8I', 1, off(TEXT_ADDR), TEXT_ADDR, TEXT_ADDR,
+                            TEXT_SZ, TEXT_SZ, 5, 0x1000)
+          ph += struct.pack('<8I', 1, off(RO_ADDR), RO_ADDR, RO_ADDR,
+                            RO_SZ, RO_SZ, 4, 0x1000)
+          ph += struct.pack('<8I', 1, off(DATA_ADDR), DATA_ADDR, DATA_ADDR,
+                            DATA_SZ, DATA_SZ + BSS_SZ, 6, 0x1000)
+
+          out = bytearray(BASE_OFF)
+          out[0:52] = ehdr
+          out[52:52 + len(ph)] = ph
+          out += code
+          out += shstr
+          out += bytes(shoff - len(out))
+
+          def sh(*a):
+              return struct.pack('<10I', *a)
+
+          out += sh(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+          out += sh(n_text, 1, 6, TEXT_ADDR, off(TEXT_ADDR), TEXT_SZ, 0, 0, 4, 0)
+          out += sh(n_ro, 1, 2, RO_ADDR, off(RO_ADDR), RO_SZ, 0, 0, 4, 0)
+          out += sh(n_data, 1, 3, DATA_ADDR, off(DATA_ADDR), DATA_SZ, 0, 0, 4, 0)
+          out += sh(n_bss, 8, 3, bss_addr, off(DATA_ADDR) + DATA_SZ, BSS_SZ, 0, 0, 4, 0)
+          out += sh(n_shstr, 3, 0, 0, shstr_off, len(shstr), 0, 0, 1, 0)
+          open('baserom.elf', 'wb').write(out)
+          print('baserom.elf', len(out))
+          EOF
+          rm code.bin
+          ls -lh baserom.elf
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download Ghidra (latest release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl tools
+          gh release download --repo NationalSecurityAgency/ghidra \
+            --pattern 'ghidra_*_PUBLIC_*.zip' --dir dl
+          ls -lh dl
+          unzip -q dl/*.zip -d tools
+          ls tools
+
+      - name: Write report script
+        run: |
+          mkdir -p ghidra_scripts reports ghproj
+          cat > ghidra_scripts/ReportAlbw.java <<'JAVA'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.address.Address;
+          import ghidra.program.model.listing.*;
+          import ghidra.program.model.mem.*;
+          import ghidra.program.model.scalar.Scalar;
+          import java.io.*;
+          import java.util.*;
+
+          public class ReportAlbw extends GhidraScript {
+            @Override
+            public void run() throws Exception {
+              String dir = System.getenv("REPORT_DIR");
+              if (dir == null) dir = "reports";
+              new File(dir).mkdirs();
+              FunctionManager fm = currentProgram.getFunctionManager();
+              Listing listing = currentProgram.getListing();
+
+              PrintWriter sum = new PrintWriter(new FileWriter(dir + "/summary.txt"));
+              sum.println("language: " + currentProgram.getLanguageID());
+              for (MemoryBlock b : currentProgram.getMemory().getBlocks()) {
+                sum.println("block " + b.getName() + " " + b.getStart() + "-" + b.getEnd() + " size=" + b.getSize());
+              }
+
+              List<Function> funcs = new ArrayList<>();
+              FunctionIterator fi = fm.getFunctions(true);
+              while (fi.hasNext()) funcs.add(fi.next());
+              sum.println("functions: " + funcs.size());
+
+              PrintWriter fw = new PrintWriter(new FileWriter(dir + "/functions.txt"));
+              for (Function f : funcs) {
+                fw.println(f.getEntryPoint() + " " + f.getName() + " " + f.getBody().getNumAddresses());
+              }
+              fw.close();
+
+              List<Function> bySize = new ArrayList<>(funcs);
+              bySize.sort((a, b) -> Long.compare(b.getBody().getNumAddresses(), a.getBody().getNumAddresses()));
+              sum.println("largest functions:");
+              for (int i = 0; i < Math.min(15, bySize.size()); i++) {
+                Function f = bySize.get(i);
+                sum.println("  " + f.getEntryPoint() + " " + f.getName() + " " + f.getBody().getNumAddresses());
+              }
+
+              Map<Long, Integer> svc = new TreeMap<>();
+              PrintWriter sw = new PrintWriter(new FileWriter(dir + "/svc_sites.txt"));
+              long ninstr = 0;
+              InstructionIterator it = listing.getInstructions(true);
+              while (it.hasNext()) {
+                Instruction ins = it.next();
+                ninstr++;
+                String m = ins.getMnemonicString().toLowerCase();
+                if (m.startsWith("svc") || m.startsWith("swi")) {
+                  long n = -1;
+                  Scalar s = ins.getScalar(0);
+                  if (s != null) n = s.getUnsignedValue();
+                  svc.merge(n, 1, Integer::sum);
+                  Function f = fm.getFunctionContaining(ins.getAddress());
+                  sw.println(ins.getAddress() + " svc 0x" + Long.toHexString(n) + " in " + (f == null ? "-" : f.getName()));
+                }
+              }
+              sw.close();
+              sum.println("instructions: " + ninstr);
+              sum.println("svc numbers (number: count):");
+              for (Map.Entry<Long, Integer> e : svc.entrySet()) {
+                sum.println("  0x" + Long.toHexString(e.getKey()) + ": " + e.getValue());
+              }
+
+              String[] names = {"APT:U", "fs:USER", "gsp::Gpu", "hid:USER", "dsp::DSP",
+                "cfg:u", "ptm:u", "ldr:ro", "y2r:u", "mic:u", "cam:u", "ir:USER",
+                "soc:U", "http:C", "ssl:C", "ac:u", "boss:U", "news:u", "frd:u",
+                "cecd:u", "ndm:u", "nwm::UDS", "dlp:SRVR", "dlp:FKCL", "pxi:dev",
+                "$hioFIO", "$hostio0", "$hostio1"};
+              Memory mem = currentProgram.getMemory();
+              PrintWriter nw = new PrintWriter(new FileWriter(dir + "/service_names.txt"));
+              for (String name : names) {
+                byte[] b = name.getBytes("US-ASCII");
+                Address start = currentProgram.getMinAddress();
+                int guard = 0;
+                while (start != null && guard++ < 20) {
+                  Address a = mem.findBytes(start, b, null, true, monitor);
+                  if (a == null) break;
+                  nw.println(name + " at " + a);
+                  try { start = a.add(1); } catch (Exception e) { break; }
+                }
+              }
+              nw.close();
+              sum.close();
+            }
+          }
+          JAVA
+
+      - name: Run Ghidra headless
+        run: |
+          set -euo pipefail
+          GH="$(find tools -maxdepth 1 -type d -name 'ghidra_*' | head -n 1)"
+          echo "Ghidra dir: $GH"
+          export REPORT_DIR="$PWD/reports"
+          "$GH/support/analyzeHeadless" "$PWD/ghproj" ALBW \
+            -import baserom.elf \
+            -processor "ARM:LE:32:v6" \
+            -scriptPath "$PWD/ghidra_scripts" \
+            -postScript ReportAlbw.java \
+            -deleteProject
+
+      - name: Show reports
+        run: |
+          echo "=== summary ==="
+          cat reports/summary.txt
+          echo "=== service name locations ==="
+          cat reports/service_names.txt
+          echo "=== first 40 svc sites ==="
+          head -40 reports/svc_sites.txt
+
+      - name: Upload reports (text only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: albw-reports
+          path: reports/*.txt
+          retention-days: 1
+
