@@ -1,0 +1,64 @@
+name: Inspect ALBW dump
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download dump
+        env:
+          ALBW_URL: "https://drive.usercontent.google.com/download?id=1ypm1CGmbkAgkRBdLHvxhjJo-a3BYvTE2&export=download&confirm=t"
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 --retry-all-errors \
+            -A "Mozilla/5.0" -o dump.bin "$ALBW_URL"
+          ls -lh dump.bin
+          file dump.bin
+
+      - name: Inspect headers
+        run: |
+          python3 - <<'EOF'
+          import struct
+          f = open('dump.bin', 'rb')
+
+          def rd(o, n):
+              f.seek(o)
+              return f.read(n)
+
+          def ncch(base):
+              magic = rd(base + 0x100, 4)
+              print('  NCCH magic:', magic)
+              if magic != b'NCCH':
+                  return
+              pid = struct.unpack('<Q', rd(base + 0x108, 8))[0]
+              print('  partition id: %016X' % pid)
+              print('  product code:', rd(base + 0x150, 16).rstrip(b'\0').decode('ascii', 'replace'))
+              flags = rd(base + 0x188, 8)
+              print('  flags:', flags.hex())
+              print('  NoCrypto set (decrypted):', bool(flags[7] & 4))
+
+          print('first 16 bytes:', rd(0, 16).hex())
+          print('magic at 0x0:  ', rd(0, 4))
+          print('magic at 0x100:', rd(0x100, 4))
+
+          if rd(0, 4) == b'\x7fELF':
+              print('Format: ELF')
+          elif rd(0, 4) == b'3DSX':
+              print('Format: 3DSX')
+          elif rd(0x100, 4) == b'NCSD':
+              print('Format: NCSD (.cci / .3ds)')
+              for i in range(8):
+                  off, ln = struct.unpack('<II', rd(0x120 + i * 8, 8))
+                  if ln:
+                      print('partition', i, 'offset', hex(off * 0x200), 'size', hex(ln * 0x200))
+                      if i == 0:
+                          ncch(off * 0x200)
+          elif rd(0x100, 4) == b'NCCH':
+              print('Format: NCCH (.cxi / .app)')
+              ncch(0)
+          else:
+              hdr = struct.unpack('<I', rd(0, 4))[0]
+              print('Unknown or CIA? first u32 =', hex(hdr))
+          EOF
