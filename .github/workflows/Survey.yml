@@ -1,0 +1,118 @@
+name: Survey ALBW
+
+on:
+  workflow_dispatch:
+
+jobs:
+  survey:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download dump
+        env:
+          ALBW_URL: "https://drive.usercontent.google.com/download?id=1ypm1CGmbkAgkRBdLHvxhjJo-a3BYvTE2&export=download&confirm=t"
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 --retry-all-errors \
+            -A "Mozilla/5.0" -o dump.bin "$ALBW_URL"
+          ls -lh dump.bin
+
+      - name: Slice game partition and mark decrypted
+        run: |
+          python3 - <<'EOF'
+          OFF = 0x4000
+          SIZE = 0x2a659000
+          with open('dump.bin', 'rb') as src, open('ncch.bin', 'wb') as dst:
+              src.seek(OFF)
+              remaining = SIZE
+              while remaining:
+                  chunk = src.read(min(remaining, 16 * 1024 * 1024))
+                  if not chunk:
+                      break
+                  dst.write(chunk)
+                  remaining -= len(chunk)
+          with open('ncch.bin', 'r+b') as f:
+              f.seek(0x18F)
+              b = f.read(1)[0]
+              f.seek(0x18F)
+              f.write(bytes([b | 0x04]))
+          EOF
+          rm dump.bin
+
+      - name: Build ctrtool
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+          git clone --depth 1 https://github.com/3DSGuy/Project_CTR.git
+          cd Project_CTR/ctrtool
+          make deps || true
+          make -j4
+          CT="$(find . -name ctrtool -type f -perm -u+x | head -n 1)"
+          cp "$CT" "$GITHUB_WORKSPACE/ctrtool"
+
+      - name: Extract
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          ./ctrtool \
+            --exheader=out/exheader.bin \
+            --exefsdir=out/exefs \
+            --romfsdir=out/romfs \
+            --decompresscode \
+            ncch.bin > /dev/null
+
+      - name: Survey code and RomFS
+        run: |
+          python3 - <<'EOF'
+          import os, struct, collections
+
+          c = open('out/exefs/code.bin', 'rb').read()
+          print('code.bin size:', len(c), hex(len(c)))
+          print('first 8 words:', [hex(struct.unpack_from('<I', c, i * 4)[0]) for i in range(8)])
+          print('CRO0 occurrences inside code.bin:', c.count(b'CRO0'))
+
+          root = 'out/romfs'
+          ext = collections.Counter()
+          ext_size = collections.Counter()
+          magic = collections.Counter()
+          top = collections.Counter()
+          cro = []
+          files = []
+          for d, _, fs in os.walk(root):
+              for n in fs:
+                  p = os.path.join(d, n)
+                  s = os.path.getsize(p)
+                  e = os.path.splitext(n)[1].lower() or '(none)'
+                  ext[e] += 1
+                  ext_size[e] += s
+                  files.append((s, p))
+                  rel = os.path.relpath(p, root).split(os.sep)[0]
+                  top[rel] += 1
+                  with open(p, 'rb') as f:
+                      head = f.read(0x84)
+                  magic[head[:4]] += 1
+                  if head[0x80:0x84] == b'CRO0':
+                      cro.append(p)
+
+          print('=== files per top-level folder ===')
+          for k, v in top.most_common():
+              print(k, v)
+          print('=== extensions (count, total MB) ===')
+          for e, n in ext.most_common(30):
+              print(e, n, round(ext_size[e] / 1e6, 1))
+          print('=== first 4 bytes of files (top 30) ===')
+          for m, n in magic.most_common(30):
+              print(m, n)
+          print('=== files with CRO0 at 0x80:', len(cro))
+          for p in cro[:40]:
+              print(p)
+          print('=== 20 largest files ===')
+          for s, p in sorted(files, reverse=True)[:20]:
+              print(s, p)
+          print('=== 25 sample names from Archive ===')
+          arc = sorted(os.listdir(os.path.join(root, 'Archive')))
+          print(len(arc), 'entries')
+          for n in arc[:25]:
+              print(n)
+          EOF
+
