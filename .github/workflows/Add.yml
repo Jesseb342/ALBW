@@ -184,5 +184,67 @@ jobs:
                   + ", undefined/other: " + (size - instrBytes - dataBytes));
               }
               w.println("--- computed flow (Ghidra's view) ---");
-              for (Map.Entry
+              for (Map.Entry<String, Integer> e : sorted(flow)) w.println("  " + e.getKey() + ": " + e.getValue());
+              w.println("--- pc-writing and indirect instructions ---");
+              for (Map.Entry<String, Integer> e : sorted(cat)) w.println("  " + e.getKey() + ": " + e.getValue());
+              w.println("--- special instructions (prefix counts) ---");
+              for (Map.Entry<String, Integer> e : sorted(spec)) w.println("  " + e.getKey() + ": " + e.getValue());
+              w.println("--- coprocessor instructions (clustered) ---");
+              int n = 0;
+              for (Map.Entry<String, Integer> e : sorted(cop)) {
+                if (n++ >= 40) break;
+                w.println("  " + e.getValue() + "  " + e.getKey());
+              }
+              w.println("--- VFP (v*) mnemonics ---");
+              n = 0;
+              for (Map.Entry<String, Integer> e : sorted(vfp)) {
+                if (n++ >= 50) break;
+                w.println("  " + e.getKey() + ": " + e.getValue());
+              }
+              w.println("--- functions with most indirect jumps/calls ---");
+              n = 0;
+              for (Map.Entry<String, Integer> e : sorted(perFunc)) {
+                if (n++ >= 15) break;
+                w.println("  " + e.getKey() + ": " + e.getValue());
+              }
+              w.println("--- top 70 mnemonics ---");
+              n = 0;
+              for (Map.Entry<String, Integer> e : sorted(mn)) {
+                if (n++ >= 70) break;
+                w.println("  " + e.getKey() + ": " + e.getValue());
+              }
+              w.close();
+
+              PrintWriter mw = new PrintWriter(new FileWriter(dir + "/mnemonics.txt"));
+              for (Map.Entry<String, Integer> e : sorted(mn)) mw.println(e.getKey() + " " + e.getValue());
+              mw.close();
+            }
+          }
+          JAVA
+
+      - name: Run census
+        run: |
+          set -euo pipefail
+          GH="$(find tools -maxdepth 1 -type d -name 'ghidra_*' | head -n 1)"
+          export REPORT_DIR="$PWD/reports"
+          "$GH/support/analyzeHeadless" "$PWD/ghproj" ALBW \
+            -process baserom.elf \
+            -noanalysis \
+            -readOnly \
+            -scriptPath "$PWD/ghidra_scripts" \
+            -postScript Census.java
+
+      - name: Show reports
+        run: |
+          echo "=== census_summary ==="
+          cat reports/census_summary.txt
+          echo "=== first 40 indirect sites ==="
+          head -40 reports/indirect_sites.txt
+
+      - name: Upload reports (text only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: albw-census
+          path: reports/*.txt
+          retention-days: 1
 
