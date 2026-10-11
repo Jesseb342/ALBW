@@ -1,0 +1,280 @@
+name: Ghidra ALBW export
+
+on:
+  workflow_dispatch:
+    inputs:
+      cache_key:
+        description: "Exact v2 project cache key (e.g. ghproj-albw-v2-1234567890)"
+        required: true
+        default: "paste-the-full-v2-key-here"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Restore Ghidra project cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ghproj
+          key: ${{ inputs.cache_key }}
+          fail-on-cache-miss: true
+
+      - name: Cache status
+        run: |
+          echo "Requested key: ${{ inputs.cache_key }}"
+          echo "Restored key:  ${{ steps.cache.outputs.cache-matched-key }}"
+          du -sh ghproj
+
+      - name: Download Ghidra (latest release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl tools
+          gh release download --repo NationalSecurityAgency/ghidra \
+            --pattern 'ghidra_*_PUBLIC_*.zip' --dir dl
+          unzip -q dl/*.zip -d tools
+
+      - name: Write export script
+        run: |
+          mkdir -p ghidra_scripts export
+          cat > ghidra_scripts/Export.java <<'JAVA'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.address.*;
+          import ghidra.program.model.lang.Register;
+          import ghidra.program.model.lang.RegisterValue;
+          import ghidra.program.model.listing.*;
+          import ghidra.program.model.mem.*;
+          import java.io.*;
+          import java.util.*;
+          import java.util.regex.*;
+
+          public class Export extends GhidraScript {
+            static final long TEXT_LO = 0x100000L;
+            static final long TEXT_HI = 0x69211cL;
+            static final Pattern CMP = Pattern.compile("^cmp\\w*\\s+(\\w+),#(0x[0-9a-f]+|\\d+)$");
+            static final Pattern SWITCH = Pattern.compile("^ldr\\w*\\s+pc,\\[pc,\\s*[-+]?r\\d+.*");
+            static final Pattern ADDPC = Pattern.compile("^add\\w*\\s+pc,pc,.*");
+            Memory mem;
+            Listing listing;
+            FunctionManager fm;
+            Register tmode;
+
+            static String hex8(long v) { return String.format("0x%08x", v); }
+            static boolean inText(long v) { return v >= TEXT_LO && v < TEXT_HI; }
+
+            static long num(String s) {
+              boolean neg = s.startsWith("-");
+              if (neg) s = s.substring(1);
+              long v = s.startsWith("0x") ? Long.parseLong(s.substring(2), 16) : Long.parseLong(s);
+              return neg ? -v : v;
+            }
+
+            Long word(long addr) {
+              try {
+                return Long.valueOf(mem.getInt(toAddr(addr), false) & 0xFFFFFFFFL);
+              } catch (Exception e) {
+                return null;
+              }
+            }
+
+            boolean isThumb(Address a) {
+              if (tmode == null) return false;
+              RegisterValue rv = currentProgram.getProgramContext().getRegisterValue(tmode, a);
+              return rv != null && rv.hasValue() && rv.getUnsignedValue().intValue() == 1;
+            }
+
+            @Override
+            public void run() throws Exception {
+              mem = currentProgram.getMemory();
+              listing = currentProgram.getListing();
+              fm = currentProgram.getFunctionManager();
+              tmode = currentProgram.getLanguage().getRegister("TMode");
+              String dir = System.getenv("EXPORT_DIR");
+              if (dir == null) dir = "export";
+              new File(dir).mkdirs();
+
+              // ---------- functions ----------
+              PrintWriter fw = new PrintWriter(new FileWriter(dir + "/functions.tsv"));
+              fw.println("# entry\tmode\tsize\tranges\tname");
+              int nFunc = 0, nThumb = 0, nMultiRange = 0;
+              FunctionIterator fi = fm.getFunctions(true);
+              while (fi.hasNext()) {
+                Function f = fi.next();
+                Address e = f.getEntryPoint();
+                long eo = e.getOffset();
+                if (!inText(eo)) continue;
+                boolean th = isThumb(e);
+                StringBuilder rs = new StringBuilder();
+                int nr = 0;
+                for (AddressRange r : f.getBody()) {
+                  if (rs.length() > 0) rs.append(';');
+                  rs.append(String.format("%x-%x", r.getMinAddress().getOffset(), r.getMaxAddress().getOffset()));
+                  nr++;
+                }
+                fw.println(hex8(eo) + "\t" + (th ? "T" : "A") + "\t" + f.getBody().getNumAddresses()
+                  + "\t" + rs + "\t" + f.getName());
+                nFunc++;
+                if (th) nThumb++;
+                if (nr > 1) nMultiRange++;
+              }
+              fw.close();
+
+              // ---------- jump tables ----------
+              PrintWriter jw = new PrintWriter(new FileWriter(dir + "/jumptables.tsv"));
+              jw.println("# site\ttable\tbound(-1=guessed)\tentries\ttargets(raw words, comma separated)");
+              int nSwitch = 0, nGuessed = 0, nAdd = 0;
+              long totalEntries = 0;
+              InstructionIterator it = listing.getInstructions(true);
+              while (it.hasNext()) {
+                Instruction x = it.next();
+                String t = x.toString().toLowerCase().trim();
+                long a = x.getAddress().getOffset();
+                if (SWITCH.matcher(t).matches()) {
+                  long bound = -1;
+                  Instruction p = x.getPrevious();
+                  for (int i = 0; i < 4 && p != null; i++) {
+                    Matcher cm = CMP.matcher(p.toString().toLowerCase().trim());
+                    if (cm.matches()) {
+                      bound = num(cm.group(2));
+                      break;
+                    }
+                    p = p.getPrevious();
+                  }
+                  long tbl = a + 8;
+                  int max = bound >= 0 ? (int) Math.min(bound, 512) : 300;
+                  StringBuilder tg = new StringBuilder();
+                  int entries = 0;
+                  for (int i = 0; i < max; i++) {
+                    Long w = word(tbl + 4L * i);
+                    if (w == null) break;
+                    long target = w.longValue() & ~1L;
+                    if (!inText(target)) break;
+                    if (bound < 0 && Math.abs(target - a) > 0x8000L) break;
+                    if (tg.length() > 0) tg.append(',');
+                    tg.append(hex8(w.longValue()));
+                    entries++;
+                  }
+                  jw.println(hex8(a) + "\t" + hex8(tbl) + "\t" + bound + "\t" + entries + "\t" + tg);
+                  nSwitch++;
+                  if (bound < 0) nGuessed++;
+                  totalEntries += entries;
+                } else if (ADDPC.matcher(t).matches()) {
+                  jw.println(hex8(a) + "\tADDPC\t-1\t0\t");
+                  nAdd++;
+                }
+              }
+              jw.close();
+
+              // ---------- data and undefined ranges inside .text ----------
+              MemoryBlock text = mem.getBlock(".text");
+              long textEnd = text.getEnd().getOffset();
+              PrintWriter dw = new PrintWriter(new FileWriter(dir + "/data_ranges.tsv"));
+              dw.println("# start\tlength  (defined data inside .text)");
+              int nData = 0;
+              long dataBytes = 0;
+              long curS = -1, curE = -1;
+              DataIterator di = listing.getDefinedData(text.getStart(), true);
+              while (di.hasNext()) {
+                Data d = di.next();
+                long a = d.getAddress().getOffset();
+                if (a > textEnd) break;
+                long len = d.getLength();
+                if (curS >= 0 && a == curE) {
+                  curE = a + len;
+                } else {
+                  if (curS >= 0) {
+                    dw.println(hex8(curS) + "\t" + (curE - curS));
+                    nData++;
+                    dataBytes += curE - curS;
+                  }
+                  curS = a;
+                  curE = a + len;
+                }
+              }
+              if (curS >= 0) {
+                dw.println(hex8(curS) + "\t" + (curE - curS));
+                nData++;
+                dataBytes += curE - curS;
+              }
+              dw.close();
+
+              AddressSet textSet = new AddressSet(text.getStart(), text.getEnd());
+              PrintWriter uw = new PrintWriter(new FileWriter(dir + "/undefined_ranges.tsv"));
+              uw.println("# start\tlength  (bytes in .text that are neither code nor defined data)");
+              int nUndef = 0;
+              long undefBytes = 0;
+              for (AddressRange r : listing.getUndefinedRanges(textSet, true, monitor)) {
+                uw.println(hex8(r.getMinAddress().getOffset()) + "\t" + r.getLength());
+                nUndef++;
+                undefBytes += r.getLength();
+              }
+              uw.close();
+
+              // ---------- meta ----------
+              PrintWriter mw = new PrintWriter(new FileWriter(dir + "/meta.txt"));
+              mw.println("language: " + currentProgram.getLanguageID());
+              for (MemoryBlock b : mem.getBlocks()) {
+                if (b.getName().startsWith(".")) {
+                  mw.println("block " + b.getName() + " " + hex8(b.getStart().getOffset())
+                    + " " + hex8(b.getEnd().getOffset()) + " size=" + b.getSize());
+                }
+              }
+              mw.println("functions: " + nFunc + " (thumb entry: " + nThumb
+                + ", with several ranges: " + nMultiRange + ")");
+              mw.println("jump tables (switch): " + nSwitch + " (length guessed: " + nGuessed
+                + "), total entries: " + totalEntries + ", add-pc sites: " + nAdd);
+              mw.println("defined data ranges in .text: " + nData + " (" + dataBytes + " bytes)");
+              mw.println("undefined ranges in .text: " + nUndef + " (" + undefBytes + " bytes)");
+              mw.close();
+            }
+          }
+          JAVA
+
+      - name: Run export
+        run: |
+          set -euo pipefail
+          GH="$(find tools -maxdepth 1 -type d -name 'ghidra_*' | head -n 1)"
+          export EXPORT_DIR="$PWD/export"
+          "$GH/support/analyzeHeadless" "$PWD/ghproj" ALBW \
+            -process baserom.elf \
+            -noanalysis \
+            -readOnly \
+            -scriptPath "$PWD/ghidra_scripts" \
+            -postScript Export.java
+
+      - name: Save export to cache
+        uses: actions/cache/save@v4
+        with:
+          path: export
+          key: albw-export-${{ github.run_id }}
+
+      - name: Show export
+        run: |
+          echo "Export cache key: albw-export-${{ github.run_id }}"
+          echo "=== meta ==="
+          cat export/meta.txt
+          ls -l export
+          echo "=== functions (first 12) ==="
+          head -12 export/functions.tsv
+          echo "=== a few multi-range functions ==="
+          awk -F'\t' '$4 ~ /;/' export/functions.tsv | head -5
+          echo "=== jumptables (first 6, truncated) ==="
+          head -6 export/jumptables.tsv | cut -c1-220
+          echo "=== guessed-length tables (first 6, truncated) ==="
+          awk -F'\t' '$3 == -1' export/jumptables.tsv | head -6 | cut -c1-220
+
+      - name: Upload export (addresses only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: albw-export
+          path: export/*
+          retention-days: 7
+
