@@ -1,10 +1,10 @@
-name: Ghidra ALBW census
+name: Ghidra ALBW coverage
 
 on:
   workflow_dispatch:
 
 jobs:
-  census:
+  coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -30,199 +30,252 @@ jobs:
             --pattern 'ghidra_*_PUBLIC_*.zip' --dir dl
           unzip -q dl/*.zip -d tools
 
-      - name: Write census script
+      - name: Write coverage script
         run: |
           mkdir -p ghidra_scripts reports
-          cat > ghidra_scripts/Census.java <<'JAVA'
+          cat > ghidra_scripts/Coverage.java <<'JAVA'
           import ghidra.app.script.GhidraScript;
-          import ghidra.program.model.address.Address;
-          import ghidra.program.model.lang.Register;
-          import ghidra.program.model.lang.RegisterValue;
+          import ghidra.program.model.address.*;
           import ghidra.program.model.listing.*;
-          import ghidra.program.model.mem.MemoryBlock;
-          import ghidra.program.model.symbol.FlowType;
+          import ghidra.program.model.mem.*;
           import java.io.*;
           import java.util.*;
           import java.util.regex.*;
 
-          public class Census extends GhidraScript {
-            static final Pattern PC_DEST = Pattern.compile("^(ldr|add|sub|mov|cpy|orr|and)\\w*\\s+pc,.*");
-            static final Pattern BX_REG = Pattern.compile("^bx\\w*\\s+(\\w+)$");
-            static final Pattern BLX_REG = Pattern.compile("^blx\\w*\\s+(\\w+)$");
-            static final Pattern REGN = Pattern.compile("\\br(1[0-2]|[0-9])\\b");
-            static final String[] COPROC = {"mcr", "mrc", "cdp", "ldc", "stc"};
-            static final String[] SPECIAL = {"ldrex", "strex", "clrex", "swp", "mrs", "msr",
-              "bkpt", "udf", "cps", "wfe", "wfi", "yield", "pld", "srs", "rfe", "smc",
-              "dmb", "dsb", "isb", "svc", "swi"};
+          public class Coverage extends GhidraScript {
+            static final long TEXT_LO = 0x100000L;
+            static final long TEXT_HI = 0x69211cL;
+            static final Pattern CMP = Pattern.compile("^cmp\\w*\\s+(\\w+),#(0x[0-9a-f]+|\\d+)$");
+            static final Pattern VENEER = Pattern.compile("^ldr\\w*\\s+pc,\\[pc,#(-?0x[0-9a-f]+|-?\\d+)\\].*");
+            static final Pattern SWITCH = Pattern.compile("^ldr\\w*\\s+pc,\\[pc,\\s*[-+]?r\\d+.*");
+            static final Pattern ADDPC = Pattern.compile("^add\\w*\\s+pc,pc,.*");
+            Memory mem;
+            Listing listing;
+            FunctionManager fm;
 
-            static void bump(Map<String, Integer> m, String k) { m.merge(k, 1, Integer::sum); }
+            static String hex8(long v) { return String.format("0x%08x", v); }
+            static boolean inText(long v) { return v >= TEXT_LO && v < TEXT_HI; }
 
-            static List<Map.Entry<String, Integer>> sorted(Map<String, Integer> m) {
-              List<Map.Entry<String, Integer>> l = new ArrayList<>(m.entrySet());
-              l.sort((a, b) -> b.getValue() - a.getValue());
-              return l;
+            static long num(String s) {
+              boolean neg = s.startsWith("-");
+              if (neg) s = s.substring(1);
+              long v = s.startsWith("0x") ? Long.parseLong(s.substring(2), 16) : Long.parseLong(s);
+              return neg ? -v : v;
             }
 
-            boolean isThumb(Register tm, Address a) {
-              if (tm == null) return false;
-              RegisterValue rv = currentProgram.getProgramContext().getRegisterValue(tm, a);
-              return rv != null && rv.hasValue() && rv.getUnsignedValue().intValue() == 1;
+            Long word(long addr) {
+              try {
+                return Long.valueOf(mem.getInt(toAddr(addr), false) & 0xFFFFFFFFL);
+              } catch (Exception e) {
+                return null;
+              }
             }
 
             @Override
             public void run() throws Exception {
+              mem = currentProgram.getMemory();
+              listing = currentProgram.getListing();
+              fm = currentProgram.getFunctionManager();
               String dir = System.getenv("REPORT_DIR");
               if (dir == null) dir = "reports";
               new File(dir).mkdirs();
-              Listing listing = currentProgram.getListing();
-              FunctionManager fm = currentProgram.getFunctionManager();
-              Register tmode = currentProgram.getLanguage().getRegister("TMode");
+              PrintWriter sum = new PrintWriter(new FileWriter(dir + "/coverage_summary.txt"));
 
-              long total = 0, thumb = 0, instrBytes = 0, direct = 0;
-              Map<String, Integer> mn = new HashMap<>();
-              Map<String, Integer> flow = new HashMap<>();
-              Map<String, Integer> cat = new HashMap<>();
-              Map<String, Integer> cop = new HashMap<>();
-              Map<String, Integer> vfp = new HashMap<>();
-              Map<String, Integer> spec = new HashMap<>();
-              Map<String, Integer> perFunc = new HashMap<>();
+              // ---------- PART 1: undefined ranges inside .text ----------
+              MemoryBlock text = mem.getBlock(".text");
+              AddressSet textSet = new AddressSet(text.getStart(), text.getEnd());
+              AddressSetView undef = listing.getUndefinedRanges(textSet, true, monitor);
+              Map<String, long[]> byClass = new TreeMap<>();
+              List<long[]> codeLike = new ArrayList<>();
+              PrintWriter uw = new PrintWriter(new FileWriter(dir + "/undefined_ranges.txt"));
+              long undefTotal = 0;
+              int nRanges = 0;
+              int lines = 0;
+              for (AddressRange r : undef) {
+                long start = r.getMinAddress().getOffset();
+                long len = r.getLength();
+                undefTotal += len;
+                nRanges++;
+                String cls = "unreadable";
+                try {
+                  int n = (int) Math.min(len, 1L << 20);
+                  byte[] buf = new byte[n];
+                  mem.getBytes(r.getMinAddress(), buf);
+                  int zeros = 0;
+                  for (int i = 0; i < n; i++) if (buf[i] == 0) zeros++;
+                  if (zeros == n) {
+                    cls = "zero-pad";
+                  } else {
+                    int skip = (int) ((4 - (start & 3)) & 3);
+                    int total = 0, cond = 0, ptr = 0;
+                    for (int i = skip; i + 4 <= n; i += 4) {
+                      long w = (buf[i] & 0xFFL) | ((buf[i + 1] & 0xFFL) << 8)
+                        | ((buf[i + 2] & 0xFFL) << 16) | ((buf[i + 3] & 0xFFL) << 24);
+                      total++;
+                      if ((w >>> 28) == 0xEL) cond++;
+                      if (inText(w & ~1L)) ptr++;
+                    }
+                    if (total > 0 && ptr * 2 >= total) cls = "pointer-like";
+                    else if (total > 0 && cond * 10 >= total * 6) cls = "code-like";
+                    else cls = "other";
+                  }
+                } catch (Exception e) { }
+                long[] c = byClass.computeIfAbsent(cls, k -> new long[2]);
+                c[0]++;
+                c[1] += len;
+                if (cls.equals("code-like")) codeLike.add(new long[] {start, len});
+                if (lines < 20000) {
+                  uw.println(hex8(start) + " " + len + " " + cls);
+                  lines++;
+                }
+              }
+              uw.close();
+              sum.println("=== undefined ranges in .text ===");
+              sum.println("ranges: " + nRanges + ", bytes: " + undefTotal);
+              for (Map.Entry<String, long[]> e : byClass.entrySet()) {
+                sum.println("  " + e.getKey() + ": " + e.getValue()[0] + " ranges, " + e.getValue()[1] + " bytes");
+              }
+              codeLike.sort((a, b) -> Long.compare(b[1], a[1]));
+              sum.println("largest code-like ranges:");
+              for (int i = 0; i < Math.min(25, codeLike.size()); i++) {
+                sum.println("  " + hex8(codeLike.get(i)[0]) + " size " + codeLike.get(i)[1]);
+              }
 
-              PrintWriter sites = new PrintWriter(new FileWriter(dir + "/indirect_sites.txt"));
-              int siteLines = 0;
+              // ---------- PART 2: pointers into code from data ----------
+              long ptrTotal = 0, known = 0, mid = 0, undefT = 0, thumbPtr = 0;
+              TreeSet<Long> undefTargets = new TreeSet<>();
+              PrintWriter pw = new PrintWriter(new FileWriter(dir + "/code_pointers.txt"));
+              int pl = 0;
+              for (String bn : new String[] {".rodata", ".data"}) {
+                MemoryBlock b = mem.getBlock(bn);
+                if (b == null) continue;
+                long s = b.getStart().getOffset();
+                long e = b.getEnd().getOffset();
+                for (long a = s; a + 3 <= e; a += 4) {
+                  Long w = word(a);
+                  if (w == null) continue;
+                  long v = w.longValue();
+                  long t = v & ~1L;
+                  if (!inText(t)) continue;
+                  boolean thumb = (v & 1L) != 0;
+                  if (!thumb && (v & 3L) != 0) continue;
+                  ptrTotal++;
+                  if (thumb) thumbPtr++;
+                  Address ta = toAddr(t);
+                  if (fm.getFunctionAt(ta) != null) {
+                    known++;
+                    continue;
+                  }
+                  String kind;
+                  if (listing.getInstructionAt(ta) != null) {
+                    mid++;
+                    Function cf = fm.getFunctionContaining(ta);
+                    kind = "inside-code in " + (cf == null ? "-" : cf.getName());
+                  } else {
+                    undefT++;
+                    undefTargets.add(Long.valueOf(t));
+                    kind = "NOT-CODE";
+                  }
+                  if (pl < 8000) {
+                    pw.println(hex8(a) + " -> " + hex8(v) + (thumb ? " T " : " A ") + kind);
+                    pl++;
+                  }
+                }
+              }
+              pw.close();
+              sum.println("=== pointers from .rodata/.data into .text ===");
+              sum.println("total: " + ptrTotal + " (thumb-style: " + thumbPtr + ")");
+              sum.println("point at a known function: " + known);
+              sum.println("point inside a function (not at entry): " + mid);
+              sum.println("point at undefined bytes (missed code?): " + undefT
+                + " (" + undefTargets.size() + " distinct targets)");
+              int shown = 0;
+              for (Long t : undefTargets) {
+                if (shown++ >= 25) break;
+                sum.println("  " + hex8(t.longValue()));
+              }
 
+              // ---------- PART 3: jump tables and veneers ----------
+              PrintWriter jw = new PrintWriter(new FileWriter(dir + "/jumptables.txt"));
+              int nSwitch = 0, nVeneer = 0, nAdd = 0, withBound = 0, shortN = 0;
+              int stCode = 0, stData = 0, stUndef = 0, maxEntries = 0;
+              long totalEntries = 0;
+              TreeSet<Long> veneerTargets = new TreeSet<>();
+              int veneerUnres = 0;
               InstructionIterator it = listing.getInstructions(true);
               while (it.hasNext()) {
                 Instruction x = it.next();
-                total++;
-                instrBytes += x.getLength();
-                boolean th = isThumb(tmode, x.getAddress());
-                if (th) thumb++;
-                String m = x.getMnemonicString().toLowerCase();
-                bump(mn, m);
                 String t = x.toString().toLowerCase().trim();
-                FlowType ft = x.getFlowType();
-                if (ft.isCall() && !ft.isComputed()) direct++;
-                if (ft.isComputed()) {
-                  bump(flow, (ft.isCall() ? "call " : "") + (ft.isJump() ? "jump " : "")
-                    + (ft.isTerminal() ? "terminal" : "non-terminal"));
-                }
-
-                for (String c : COPROC) {
-                  if (m.startsWith(c)) {
-                    bump(cop, REGN.matcher(t).replaceAll("rN"));
-                    break;
-                  }
-                }
-                if (m.startsWith("v")) {
-                  int dot = m.indexOf('.');
-                  bump(vfp, dot > 0 ? m.substring(0, dot) : m);
-                }
-                for (String s : SPECIAL) {
-                  if (m.startsWith(s)) { bump(spec, s); break; }
-                }
-
-                String category = null;
-                Matcher mm;
-                if ((mm = BX_REG.matcher(t)).matches()) {
-                  category = mm.group(1).equals("lr") ? "bx lr (return)" : "bx reg (indirect jump)";
-                } else if (BLX_REG.matcher(t).matches()) {
-                  category = "blx reg (indirect call)";
-                } else if (PC_DEST.matcher(t).matches()) {
-                  if (t.contains("[sp") || t.matches("^(mov|cpy)\\w*\\s+pc,lr.*")) {
-                    category = "return via pc write";
-                  } else if (t.startsWith("add") && t.contains("pc,pc")) {
-                    category = "jump table: add pc,pc";
-                  } else if (t.startsWith("ldr") && t.contains("[pc")) {
-                    category = "jump table: ldr pc,[pc,..]";
-                  } else {
-                    category = "other write to pc";
-                  }
-                }
-                if (category != null) {
-                  bump(cat, category);
-                  if (!category.contains("return")) {
-                    Function f = fm.getFunctionContaining(x.getAddress());
-                    String fn = f == null ? "-" : f.getName();
-                    bump(perFunc, fn);
-                    if (siteLines < 6000) {
-                      sites.println(x.getAddress() + " " + (th ? "T" : "A") + " " + fn
-                        + " | " + category + " | " + t);
-                      siteLines++;
+                long a = x.getAddress().getOffset();
+                Matcher m;
+                if (SWITCH.matcher(t).matches()) {
+                  nSwitch++;
+                  long bound = -1;
+                  Instruction p = x.getPrevious();
+                  for (int i = 0; i < 4 && p != null; i++) {
+                    Matcher cm = CMP.matcher(p.toString().toLowerCase().trim());
+                    if (cm.matches()) {
+                      bound = num(cm.group(2));
+                      break;
                     }
+                    p = p.getPrevious();
                   }
+                  long tbl = a + 8;
+                  int max = bound >= 0 ? (int) Math.min(bound + 1, 512) : 300;
+                  int entries = 0;
+                  List<String> first = new ArrayList<>();
+                  for (int i = 0; i < max; i++) {
+                    Long w = word(tbl + 4L * i);
+                    if (w == null || !inText(w.longValue() & ~1L)) break;
+                    entries++;
+                    if (first.size() < 3) first.add(hex8(w.longValue()));
+                  }
+                  String status;
+                  Address tbla = toAddr(tbl);
+                  if (listing.getInstructionAt(tbla) != null) {
+                    status = "decoded-as-code";
+                    stCode++;
+                  } else if (listing.getDefinedDataAt(tbla) != null) {
+                    status = "data";
+                    stData++;
+                  } else {
+                    status = "undefined";
+                    stUndef++;
+                  }
+                  if (bound >= 0) {
+                    withBound++;
+                    if (entries < bound + 1) shortN++;
+                  }
+                  totalEntries += entries;
+                  if (entries > maxEntries) maxEntries = entries;
+                  jw.println(hex8(a) + " switch bound=" + bound + " entries=" + entries
+                    + " table=" + hex8(tbl) + " " + status + " first=" + first + " | " + t);
+                } else if ((m = VENEER.matcher(t)).matches()) {
+                  nVeneer++;
+                  long imm = num(m.group(1));
+                  Long w = word(a + 8 + imm);
+                  if (w != null) veneerTargets.add(w); else veneerUnres++;
+                  jw.println(hex8(a) + " veneer target=" + (w == null ? "?" : hex8(w.longValue())) + " | " + t);
+                } else if (ADDPC.matcher(t).matches()) {
+                  nAdd++;
+                  jw.println(hex8(a) + " add-pc | " + t);
                 }
               }
-              sites.close();
-
-              long thumbFuncs = 0, funcs = 0;
-              FunctionIterator fi = fm.getFunctions(true);
-              while (fi.hasNext()) {
-                Function f = fi.next();
-                funcs++;
-                if (isThumb(tmode, f.getEntryPoint())) thumbFuncs++;
-              }
-
-              MemoryBlock text = currentProgram.getMemory().getBlock(".text");
-              long dataBytes = 0;
-              if (text != null) {
-                DataIterator di = listing.getDefinedData(text.getStart(), true);
-                while (di.hasNext()) {
-                  Data d = di.next();
-                  if (!text.contains(d.getAddress())) break;
-                  dataBytes += d.getLength();
-                }
-              }
-
-              PrintWriter w = new PrintWriter(new FileWriter(dir + "/census_summary.txt"));
-              w.println("instructions: " + total + " (thumb: " + thumb + ", arm: " + (total - thumb) + ")");
-              w.println("functions: " + funcs + " (thumb entry: " + thumbFuncs + ")");
-              w.println("direct calls (bl/blx imm): " + direct);
-              if (text != null) {
-                long size = text.getSize();
-                w.println(".text size: " + size + " bytes, instruction bytes: " + instrBytes
-                  + ", defined data bytes: " + dataBytes
-                  + ", undefined/other: " + (size - instrBytes - dataBytes));
-              }
-              w.println("--- computed flow (Ghidra's view) ---");
-              for (Map.Entry<String, Integer> e : sorted(flow)) w.println("  " + e.getKey() + ": " + e.getValue());
-              w.println("--- pc-writing and indirect instructions ---");
-              for (Map.Entry<String, Integer> e : sorted(cat)) w.println("  " + e.getKey() + ": " + e.getValue());
-              w.println("--- special instructions (prefix counts) ---");
-              for (Map.Entry<String, Integer> e : sorted(spec)) w.println("  " + e.getKey() + ": " + e.getValue());
-              w.println("--- coprocessor instructions (clustered) ---");
-              int n = 0;
-              for (Map.Entry<String, Integer> e : sorted(cop)) {
-                if (n++ >= 40) break;
-                w.println("  " + e.getValue() + "  " + e.getKey());
-              }
-              w.println("--- VFP (v*) mnemonics ---");
-              n = 0;
-              for (Map.Entry<String, Integer> e : sorted(vfp)) {
-                if (n++ >= 50) break;
-                w.println("  " + e.getKey() + ": " + e.getValue());
-              }
-              w.println("--- functions with most indirect jumps/calls ---");
-              n = 0;
-              for (Map.Entry<String, Integer> e : sorted(perFunc)) {
-                if (n++ >= 15) break;
-                w.println("  " + e.getKey() + ": " + e.getValue());
-              }
-              w.println("--- top 70 mnemonics ---");
-              n = 0;
-              for (Map.Entry<String, Integer> e : sorted(mn)) {
-                if (n++ >= 70) break;
-                w.println("  " + e.getKey() + ": " + e.getValue());
-              }
-              w.close();
-
-              PrintWriter mw = new PrintWriter(new FileWriter(dir + "/mnemonics.txt"));
-              for (Map.Entry<String, Integer> e : sorted(mn)) mw.println(e.getKey() + " " + e.getValue());
-              mw.close();
+              jw.close();
+              sum.println("=== jump tables ===");
+              sum.println("switch-style (ldr pc,[pc,reg..]): " + nSwitch);
+              sum.println("  with a cmp bound found: " + withBound + ", entries shorter than bound: " + shortN);
+              sum.println("  total entries: " + totalEntries + ", largest table: " + maxEntries);
+              sum.println("  table region currently: decoded-as-code " + stCode + ", data " + stData + ", undefined " + stUndef);
+              sum.println("veneers (ldr pc,[pc,#imm]): " + nVeneer
+                + ", distinct targets: " + veneerTargets.size() + ", unresolved: " + veneerUnres);
+              sum.println("add pc,pc,reg: " + nAdd);
+              sum.close();
             }
           }
           JAVA
 
-      - name: Run census
+      - name: Run coverage
         run: |
           set -euo pipefail
           GH="$(find tools -maxdepth 1 -type d -name 'ghidra_*' | head -n 1)"
@@ -232,19 +285,20 @@ jobs:
             -noanalysis \
             -readOnly \
             -scriptPath "$PWD/ghidra_scripts" \
-            -postScript Census.java
+            -postScript Coverage.java
 
       - name: Show reports
         run: |
-          echo "=== census_summary ==="
-          cat reports/census_summary.txt
-          echo "=== first 40 indirect sites ==="
-          head -40 reports/indirect_sites.txt
+          echo "=== coverage_summary ==="
+          cat reports/coverage_summary.txt
+          echo "=== jumptables (first 25) ==="
+          head -25 reports/jumptables.txt
+          echo "=== code_pointers (first 30) ==="
+          head -30 reports/code_pointers.txt
 
       - name: Upload reports (text only)
         uses: actions/upload-artifact@v4
         with:
-          name: albw-census
+          name: albw-coverage
           path: reports/*.txt
           retention-days: 1
-
