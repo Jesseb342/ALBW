@@ -1,0 +1,248 @@
+name: Ghidra ALBW seed functions
+
+on:
+  workflow_dispatch:
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Restore Ghidra project cache (newest first)
+        uses: actions/cache/restore@v4
+        with:
+          path: ghproj
+          key: ghproj-albw-v2-none
+          restore-keys: |
+            ghproj-albw-v2-
+            ghproj-albw-v1
+          fail-on-cache-miss: true
+
+      - name: Download Ghidra (latest release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl tools
+          gh release download --repo NationalSecurityAgency/ghidra \
+            --pattern 'ghidra_*_PUBLIC_*.zip' --dir dl
+          unzip -q dl/*.zip -d tools
+
+      - name: Write seed script
+        run: |
+          mkdir -p ghidra_scripts reports
+          cat > ghidra_scripts/Seed.java <<'JAVA'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.address.*;
+          import ghidra.program.model.lang.Register;
+          import ghidra.program.model.listing.*;
+          import ghidra.program.model.mem.*;
+          import java.io.*;
+          import java.math.BigInteger;
+          import java.util.*;
+
+          public class Seed extends GhidraScript {
+            static final long TEXT_LO = 0x100000L;
+            static final long TEXT_HI = 0x69211cL;
+            Memory mem;
+            Listing listing;
+            FunctionManager fm;
+            Register tmode;
+
+            static String hex8(long v) { return String.format("0x%08x", v); }
+            static boolean inText(long v) { return v >= TEXT_LO && v < TEXT_HI; }
+
+            Long word(long addr) {
+              try {
+                return Long.valueOf(mem.getInt(toAddr(addr), false) & 0xFFFFFFFFL);
+              } catch (Exception e) {
+                return null;
+              }
+            }
+
+            // 1 = known function entry, 2 = undefined bytes (seedable), 3 = other code or data
+            int classify(long t) {
+              Address a = toAddr(t);
+              if (fm.getFunctionAt(a) != null) return 1;
+              if (listing.getInstructionContaining(a) != null) return 3;
+              if (listing.getDefinedDataContaining(a) != null) return 3;
+              return 2;
+            }
+
+            void flushRun(List<long[]> run, Map<Long, Boolean> seeds, int[] stats) {
+              int n = run.size();
+              if (n < 3) return;
+              int known = 0;
+              for (long[] it : run) if (it[2] == 1) known++;
+              if (known < 1 && n < 5) return;
+              stats[0]++;
+              for (long[] it : run) {
+                if (it[2] == 2) seeds.put(Long.valueOf(it[0]), Boolean.valueOf(it[1] == 1));
+              }
+            }
+
+            void collectRunSeeds(Map<Long, Boolean> seeds, int[] stats) {
+              for (String bn : new String[] {".rodata", ".data"}) {
+                MemoryBlock b = mem.getBlock(bn);
+                if (b == null) continue;
+                long s = b.getStart().getOffset();
+                long e = b.getEnd().getOffset();
+                List<long[]> run = new ArrayList<>();
+                for (long a = s; a + 3 <= e; a += 4) {
+                  Long w = word(a);
+                  long[] item = null;
+                  if (w != null) {
+                    long v = w.longValue();
+                    boolean thumb = (v & 1L) != 0;
+                    long t = v & ~1L;
+                    if (inText(t) && (thumb || (v & 3L) == 0)) {
+                      int c = classify(t);
+                      if (c == 1 || c == 2) item = new long[] {t, thumb ? 1 : 0, c};
+                    }
+                  }
+                  if (item != null) {
+                    run.add(item);
+                  } else {
+                    flushRun(run, seeds, stats);
+                    run.clear();
+                  }
+                }
+                flushRun(run, seeds, stats);
+              }
+            }
+
+            void collectPrologueSeeds(Map<Long, Boolean> seeds) throws Exception {
+              MemoryBlock text = mem.getBlock(".text");
+              AddressSet ts = new AddressSet(text.getStart(), text.getEnd());
+              AddressSetView undef = listing.getUndefinedRanges(ts, true, monitor);
+              for (AddressRange r : undef) {
+                long s = r.getMinAddress().getOffset();
+                long e = r.getMaxAddress().getOffset();
+                long a = (s + 3) & ~3L;
+                for (; a + 3 <= e; a += 4) {
+                  Long w = word(a);
+                  if (w == null) continue;
+                  long v = w.longValue();
+                  if ((v & 0xFFFF4000L) == 0xE92D4000L || v == 0xE52DE004L) {
+                    Long key = Long.valueOf(a);
+                    if (!seeds.containsKey(key)) seeds.put(key, Boolean.FALSE);
+                  }
+                }
+              }
+            }
+
+            boolean makeFunc(long t, boolean thumb) {
+              Address a = toAddr(t);
+              try {
+                if (thumb && tmode != null) {
+                  currentProgram.getProgramContext().setValue(tmode, a, a, BigInteger.ONE);
+                }
+                if (!disassemble(a)) return false;
+                Function f = createFunction(a, null);
+                return f != null;
+              } catch (Exception e) {
+                return false;
+              }
+            }
+
+            long undefinedBytes() throws Exception {
+              MemoryBlock text = mem.getBlock(".text");
+              AddressSet ts = new AddressSet(text.getStart(), text.getEnd());
+              long total = 0;
+              for (AddressRange r : listing.getUndefinedRanges(ts, true, monitor)) total += r.getLength();
+              return total;
+            }
+
+            @Override
+            public void run() throws Exception {
+              mem = currentProgram.getMemory();
+              listing = currentProgram.getListing();
+              fm = currentProgram.getFunctionManager();
+              tmode = currentProgram.getLanguage().getRegister("TMode");
+              String dir = System.getenv("REPORT_DIR");
+              if (dir == null) dir = "reports";
+              new File(dir).mkdirs();
+              PrintWriter sum = new PrintWriter(new FileWriter(dir + "/seed_summary.txt"));
+              PrintWriter fail = new PrintWriter(new FileWriter(dir + "/seed_failures.txt"));
+
+              sum.println("start: functions=" + fm.getFunctionCount()
+                + " undefined bytes in .text=" + undefinedBytes());
+              sum.flush();
+
+              for (int pass = 1; pass <= 4; pass++) {
+                Map<Long, Boolean> runSeeds = new TreeMap<>();
+                int[] stats = new int[1];
+                collectRunSeeds(runSeeds, stats);
+                Map<Long, Boolean> all = new TreeMap<>(runSeeds);
+                int fromRuns = runSeeds.size();
+                collectPrologueSeeds(all);
+                int fromPrologues = all.size() - fromRuns;
+
+                int created = 0;
+                int failed = 0;
+                for (Map.Entry<Long, Boolean> e : all.entrySet()) {
+                  long t = e.getKey().longValue();
+                  if (classify(t) != 2) continue;
+                  if (makeFunc(t, e.getValue().booleanValue())) {
+                    created++;
+                  } else {
+                    failed++;
+                    if (failed <= 200) fail.println("pass " + pass + " " + hex8(t));
+                  }
+                }
+                long before = fm.getFunctionCount();
+                sum.println("pass " + pass + ": pointer runs=" + stats[0]
+                  + " seeds(runs)=" + fromRuns + " seeds(prologues)=" + fromPrologues
+                  + " created=" + created + " failed=" + failed
+                  + " functions now=" + before);
+                sum.flush();
+                if (created == 0) break;
+                analyzeChanges(currentProgram);
+                sum.println("  after analysis: functions=" + fm.getFunctionCount()
+                  + " undefined bytes in .text=" + undefinedBytes());
+                sum.flush();
+              }
+
+              sum.println("final: functions=" + fm.getFunctionCount()
+                + " undefined bytes in .text=" + undefinedBytes());
+              sum.close();
+              fail.close();
+            }
+          }
+          JAVA
+
+      - name: Run seeding (modifies the project)
+        run: |
+          set -euo pipefail
+          GH="$(find tools -maxdepth 1 -type d -name 'ghidra_*' | head -n 1)"
+          export REPORT_DIR="$PWD/reports"
+          "$GH/support/analyzeHeadless" "$PWD/ghproj" ALBW \
+            -process baserom.elf \
+            -noanalysis \
+            -scriptPath "$PWD/ghidra_scripts" \
+            -postScript Seed.java
+
+      - name: Show reports
+        run: |
+          echo "=== seed_summary ==="
+          cat reports/seed_summary.txt
+          echo "=== first 30 failures ==="
+          head -30 reports/seed_failures.txt
+
+      - name: Save improved project to cache
+        uses: actions/cache/save@v4
+        with:
+          path: ghproj
+          key: ghproj-albw-v2-${{ github.run_id }}
+
+      - name: Upload reports (text only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: albw-seed
+          path: reports/*.txt
+          retention-days: 1
