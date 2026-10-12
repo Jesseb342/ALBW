@@ -1,0 +1,828 @@
+name: ALBW translator milestone 1
+
+on:
+  workflow_dispatch:
+    inputs:
+      export_key:
+        description: "Export cache key"
+        required: true
+        default: "albw-export-38100867527"
+      trials:
+        description: "Random trials per function"
+        required: true
+        default: "30"
+      max_functions:
+        description: "Max functions to test"
+        required: true
+        default: "300"
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Restore export
+        uses: actions/cache/restore@v4
+        with:
+          path: export
+          key: ${{ inputs.export_key }}
+          fail-on-cache-miss: true
+
+      - name: Download dump
+        env:
+          ALBW_URL: "https://drive.usercontent.google.com/download?id=1ypm1CGmbkAgkRBdLHvxhjJo-a3BYvTE2&export=download&confirm=t"
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 --retry-all-errors \
+            -A "Mozilla/5.0" -o dump.bin "$ALBW_URL"
+          ls -lh dump.bin
+
+      - name: Pull out .code
+        run: |
+          python3 - <<'EOF'
+          import struct
+          f = open('dump.bin', 'rb')
+          def rd(o, n):
+              f.seek(o)
+              return f.read(n)
+          def u32(o):
+              return struct.unpack('<I', rd(o, 4))[0]
+          base = u32(0x120) * 0x200
+          assert rd(base + 0x100, 4) == b'NCCH'
+          exefs = base + u32(base + 0x1A0) * 0x200
+          hdr = rd(exefs, 0xA0)
+          code_off = code_size = None
+          for i in range(10):
+              e = hdr[i * 16:(i + 1) * 16]
+              if e[:8].rstrip(b'\0') == b'.code':
+                  code_off, code_size = struct.unpack('<II', e[8:])
+          assert code_size == 0x628000, hex(code_size)
+          code = rd(exefs + 0x200 + code_off, code_size)
+          assert struct.unpack_from('<I', code, 0)[0] == 0xEB000007
+          open('code.bin', 'wb').write(code)
+          print('wrote code.bin', len(code))
+          EOF
+          rm dump.bin
+
+      - name: Install tools
+        run: pip install capstone unicorn numpy
+
+      - name: Write translator
+        run: |
+          cat > tr.py <<'PY'
+          import os, re, sys, struct, collections, random, subprocess, time
+          import numpy as np
+          from capstone import Cs, CS_ARCH_ARM, CS_MODE_ARM
+          from unicorn import Uc, UC_ARCH_ARM, UC_MODE_ARM, UcError
+          from unicorn import UC_PROT_ALL, UC_PROT_READ, UC_PROT_EXEC
+          from unicorn import arm_const as A
+
+          TEXT_LO = 0x100000
+          TEXT_HI = 0x69211c
+          CODE_LEN = 0x628000
+          SCR_BASE = 0x730000
+          SCR_SIZE = 0x2000
+          RET_ADDR = 0x00F00000
+          SP_INIT = SCR_BASE + 0x1F00
+          TRIALS = int(os.environ.get('TRIALS', '30'))
+          MAXF = int(os.environ.get('MAXF', '300'))
+          MAXSIZE = 800
+          MINSIZE = 8
+
+          code = open('code.bin', 'rb').read()
+          assert len(code) == CODE_LEN
+          md = Cs(CS_ARCH_ARM, CS_MODE_ARM)
+          t0 = time.time()
+
+          class Unsupp(Exception):
+              pass
+
+          CCS = ['eq', 'ne', 'cs', 'cc', 'hs', 'lo', 'mi', 'pl', 'vs', 'vc', 'hi', 'ls', 'ge', 'lt', 'gt', 'le']
+          VKNOWN = set('vldr vstr vmov vmul vmla vmls vnmla vnmls vnmul vadd vsub vdiv vsqrt vabs vneg vcmp vcmpe vcvt vmrs vmsr vpush vpop vldmia vldmdb vstmia vstmdb mrc mcr mrc2 mcr2 svc swi ldc stc cdp'.split())
+
+          def mnem(w, addr):
+              try:
+                  for ins in md.disasm(struct.pack('<I', w), addr):
+                      m = ins.mnemonic.split('.')[0]
+                      if m not in VKNOWN and len(m) > 2 and m[-2:] in CCS and m[:-2] in VKNOWN:
+                          m = m[:-2]
+                      return m
+              except Exception:
+                  pass
+              return '?'
+
+          def ror32(v, n):
+              n &= 31
+              return (((v >> n) | (v << (32 - n))) & 0xFFFFFFFF) if n else v
+
+          CONDC = {0: 'Z', 1: '!Z', 2: 'C', 3: '!C', 4: 'N', 5: '!N', 6: 'V', 7: '!V',
+                   8: '(C && !Z)', 9: '(!C || Z)', 10: '(N == V)', 11: '(N != V)',
+                   12: '(!Z && N == V)', 13: '(Z || N != V)'}
+
+          def rexp(n, addr):
+              if n == 15:
+                  return '0x%08xu' % ((addr + 8) & 0xFFFFFFFF)
+              return 'r[%d]' % n
+
+          def shift_nocarry(rm, st, n, addr):
+              v = rexp(rm, addr)
+              if st == 0:
+                  return 'SHL(%s, %du)' % (v, n)
+              if st == 1:
+                  return 'SHR(%s, %du)' % (v, 32 if n == 0 else n)
+              if st == 2:
+                  return 'SAR(%s, %du)' % (v, 32 if n == 0 else n)
+              if n == 0:
+                  return 'RRXC(%s, C)' % v
+              return 'ROR(%s, %du)' % (v, n)
+
+          def memop(P, U, W, L, rn, rd, off, kind, addr):
+              if rn == 15 and (W or not P):
+                  raise Unsupp('pc base with writeback or post-index')
+              if (W or not P) and rn == rd:
+                  raise Unsupp('load/store writeback to the transferred register')
+              op = '+' if U else '-'
+              s = 'uint32_t b = %s, o = %s, a; ' % (rexp(rn, addr), off)
+              s += 'a = %s; ' % (('b %s o' % op) if P else 'b')
+              if L:
+                  acc = {'W': 'RD32(a)', 'B': 'RD8(a)', 'H': 'RD16(a)',
+                         'SB': '(uint32_t)(int32_t)(int8_t)RD8(a)',
+                         'SH': '(uint32_t)(int32_t)(int16_t)RD16(a)'}[kind]
+                  s += 'r[%d] = %s; ' % (rd, acc)
+              else:
+                  s += 'WR%s(a, r[%d]); ' % ({'W': '32', 'B': '8', 'H': '16'}[kind], rd)
+              if P and W:
+                  s += 'r[%d] = a; ' % rn
+              if not P:
+                  s += 'r[%d] = b %s o; ' % (rn, op)
+              return '{ ' + s + '}'
+
+          def halfword(w, addr):
+              P = (w >> 24) & 1
+              U = (w >> 23) & 1
+              I = (w >> 22) & 1
+              W = (w >> 21) & 1
+              L = (w >> 20) & 1
+              rn = (w >> 16) & 15
+              rd = (w >> 12) & 15
+              sh = (w >> 5) & 3
+              if sh == 0:
+                  raise Unsupp('swp/ldrex/strex (sync)')
+              if not L and sh != 1:
+                  raise Unsupp('ldrd/strd')
+              if (not P) and W:
+                  raise Unsupp('ldrht/strht')
+              if rd == 15:
+                  raise Unsupp('halfword transfer with pc')
+              if I:
+                  off = '%du' % (((w >> 4) & 0xF0) | (w & 0xF))
+              else:
+                  rm = w & 15
+                  if rm == 15:
+                      raise Unsupp('halfword transfer offset is pc')
+                  off = 'r[%d]' % rm
+              return memop(P, U, W, L, rn, rd, off, {1: 'H', 2: 'SB', 3: 'SH'}[sh], addr)
+
+          def single(w, cls, addr):
+              P = (w >> 24) & 1
+              U = (w >> 23) & 1
+              B = (w >> 22) & 1
+              W = (w >> 21) & 1
+              L = (w >> 20) & 1
+              rn = (w >> 16) & 15
+              rd = (w >> 12) & 15
+              if cls == 3 and (w & 0x10):
+                  raise Unsupp('media instruction (uxtb/rev/pkh/etc)')
+              if (not P) and W:
+                  raise Unsupp('ldrt/strt')
+              if cls == 2:
+                  off = '%du' % (w & 0xFFF)
+              else:
+                  rm = w & 15
+                  if rm == 15:
+                      raise Unsupp('register offset is pc')
+                  off = shift_nocarry(rm, (w >> 5) & 3, (w >> 7) & 31, addr)
+              if rd == 15:
+                  if L and rn == 13 and (not P) and cls == 2 and U and not B:
+                      return '{ uint32_t b = r[13]; r[15] = RD32(b); r[13] = b + %s; goto done; }' % off, True
+                  raise Unsupp('ldr/str with pc as the data register')
+              return memop(P, U, W, L, rn, rd, off, 'B' if B else 'W', addr), False
+
+          def block(w, addr):
+              P = (w >> 24) & 1
+              U = (w >> 23) & 1
+              S = (w >> 22) & 1
+              W = (w >> 21) & 1
+              L = (w >> 20) & 1
+              rn = (w >> 16) & 15
+              lst = w & 0xFFFF
+              if S:
+                  raise Unsupp('ldm/stm with S bit')
+              if lst == 0 or rn == 15:
+                  raise Unsupp('ldm/stm with empty list or pc base')
+              regs = [i for i in range(16) if (lst >> i) & 1]
+              n = len(regs)
+              if (not L) and 15 in regs:
+                  raise Unsupp('stm with pc in list')
+              if L and 15 in regs and rn != 13:
+                  raise Unsupp('ldm into pc from a non-sp base')
+              if W and rn in regs:
+                  raise Unsupp('ldm/stm writeback with base in list')
+              if U and not P:
+                  start = 'b'
+              elif U and P:
+                  start = 'b + 4u'
+              elif (not U) and (not P):
+                  start = 'b - %du' % (4 * n - 4)
+              else:
+                  start = 'b - %du' % (4 * n)
+              s = 'uint32_t b = r[%d], a = %s; ' % (rn, start)
+              for i in regs:
+                  if L:
+                      s += 'r[%d] = RD32(a); a += 4u; ' % i
+                  else:
+                      s += 'WR32(a, r[%d]); a += 4u; ' % i
+              if W:
+                  s += 'r[%d] = b %s %du; ' % (rn, '+' if U else '-', 4 * n)
+              end = False
+              if L and 15 in regs:
+                  s += 'goto done; '
+                  end = True
+              return '{ ' + s + '}', end
+
+          def branch(w, addr, lo, hix):
+              if (w >> 24) & 1:
+                  raise Unsupp('bl (call)')
+              off = w & 0xFFFFFF
+              if off & 0x800000:
+                  off -= 0x1000000
+              tgt = (addr + 8 + off * 4) & 0xFFFFFFFF
+              if not (lo <= tgt < hix):
+                  raise Unsupp('branch leaves the function (tail call or shared code)')
+              return 'if (++steps > LIMIT) { c->status = 1; goto done; } goto L_%08x;' % tgt, True
+
+          def dataproc(w, cls, addr):
+              op = (w >> 21) & 15
+              S = (w >> 20) & 1
+              rn = (w >> 16) & 15
+              rd = (w >> 12) & 15
+              if 8 <= op <= 11 and not S:
+                  raise Unsupp('misc (mrs/msr/qadd/movw/hint)')
+              pre = 'uint32_t sc = C;'
+              if cls == 1:
+                  rot = (w >> 8) & 15
+                  imm = ror32(w & 0xFF, rot * 2)
+                  o2 = '0x%08xu' % imm
+                  if rot:
+                      pre += ' sc = %du;' % (imm >> 31)
+                  rm = None
+              else:
+                  rm = w & 15
+                  st = (w >> 5) & 3
+                  if (w & 0x10) == 0:
+                      n = (w >> 7) & 31
+                      v = rexp(rm, addr)
+                      if st == 0:
+                          o2 = 'shl_c(%s, %du, C, &sc)' % (v, n)
+                      elif st == 1:
+                          o2 = 'shr_c(%s, %du, C, &sc)' % (v, 32 if n == 0 else n)
+                      elif st == 2:
+                          o2 = 'sar_c(%s, %du, C, &sc)' % (v, 32 if n == 0 else n)
+                      elif n == 0:
+                          o2 = 'rrx_c(%s, C, &sc)' % v
+                      else:
+                          o2 = 'ror_c(%s, %du, C, &sc)' % (v, n)
+                  else:
+                      rs = (w >> 8) & 15
+                      if rm == 15 or rs == 15 or (rn == 15 and op not in (13, 15)):
+                          raise Unsupp('register-shifted operand using pc')
+                      o2 = '%s(r[%d], r[%d] & 0xFFu, C, &sc)' % (['shl_c', 'shr_c', 'sar_c', 'ror_c'][st], rm, rs)
+              if rd == 15 and not (8 <= op <= 11):
+                  if op == 13 and not S and cls == 0 and (w & 0xFFF) == 14:
+                      return 'r[15] = r[14]; goto done;', True
+                  raise Unsupp('data-processing write to pc')
+              s = pre + ' uint32_t o2 = %s;' % o2
+              if op not in (13, 15):
+                  s += ' uint32_t a = %s;' % rexp(rn, addr)
+              s += ' uint32_t res; uint64_t t; (void)t;'
+              nz = ' N = res >> 31; Z = (res == 0);' if S else ''
+              lg = nz + (' C = sc;' if S else '')
+
+              def sub(x, y):
+                  r = ' res = %s - %s;' % (x, y)
+                  if S:
+                      r += ' C = (%s >= %s); V = ((%s ^ %s) & (%s ^ res)) >> 31;' % (x, y, x, y, x)
+                  return r + nz
+
+              def add(x, y, carry):
+                  r = ' t = (uint64_t)%s + %s%s; res = (uint32_t)t;' % (x, y, ' + C' if carry else '')
+                  if S:
+                      r += ' C = (uint32_t)(t >> 32); V = ((%s ^ res) & (%s ^ res)) >> 31;' % (x, y)
+                  return r + nz
+
+              def sbc(x, y):
+                  r = ' t = (uint64_t)%s + (uint32_t)~%s + C; res = (uint32_t)t;' % (x, y)
+                  if S:
+                      r += ' C = (uint32_t)(t >> 32); V = ((%s ^ %s) & (%s ^ res)) >> 31;' % (x, y, x)
+                  return r + nz
+
+              if op == 0 or op == 8:
+                  s += ' res = a & o2;' + lg
+              elif op == 1 or op == 9:
+                  s += ' res = a ^ o2;' + lg
+              elif op == 2 or op == 10:
+                  s += sub('a', 'o2')
+              elif op == 3:
+                  s += sub('o2', 'a')
+              elif op == 4 or op == 11:
+                  s += add('a', 'o2', False)
+              elif op == 5:
+                  s += add('a', 'o2', True)
+              elif op == 6:
+                  s += sbc('a', 'o2')
+              elif op == 7:
+                  s += sbc('o2', 'a')
+              elif op == 12:
+                  s += ' res = a | o2;' + lg
+              elif op == 13:
+                  s += ' res = o2;' + lg
+              elif op == 14:
+                  s += ' res = a & ~o2;' + lg
+              else:
+                  s += ' res = ~o2;' + lg
+              if not (8 <= op <= 11):
+                  s += ' r[%d] = res;' % rd
+              return '{ ' + s + ' }', False
+
+          def xlat(w, addr, lo, hix):
+              cc = w >> 28
+              if cc == 15:
+                  raise Unsupp('unconditional-space instruction (pld/blx imm/etc)')
+              cls = (w >> 25) & 7
+              end = False
+              if (w & 0x0FFFFFFF) == 0x0320F000:
+                  body = ''
+              elif cls == 0 and (w & 0x0FFFFFF0) == 0x012FFF10:
+                  if (w & 15) != 14:
+                      raise Unsupp('bx to a register other than lr (indirect jump)')
+                  body = 'r[15] = r[14]; goto done;'
+                  end = True
+              elif cls == 0 and (w & 0x0FFFFFF0) == 0x012FFF30:
+                  raise Unsupp('blx register (indirect call)')
+              elif cls == 0 and (w & 0x0FFF0FF0) == 0x016F0F10:
+                  rd = (w >> 12) & 15
+                  rm = w & 15
+                  if rd == 15 or rm == 15:
+                      raise Unsupp('clz with pc')
+                  body = '{ r[%d] = r[%d] ? (uint32_t)__builtin_clz(r[%d]) : 32u; }' % (rd, rm, rm)
+              elif cls == 0 and (w & 0x0FC000F0) == 0x00000090:
+                  A_ = (w >> 21) & 1
+                  S = (w >> 20) & 1
+                  rd = (w >> 16) & 15
+                  rn = (w >> 12) & 15
+                  rs = (w >> 8) & 15
+                  rm = w & 15
+                  if 15 in (rd, rs, rm) or (A_ and rn == 15):
+                      raise Unsupp('mul/mla with pc')
+                  body = '{ uint32_t res = r[%d] * r[%d]%s; r[%d] = res;%s }' % (
+                      rm, rs, (' + r[%d]' % rn) if A_ else '', rd,
+                      ' N = res >> 31; Z = (res == 0);' if S else '')
+              elif cls == 0 and (w & 0x0F8000F0) == 0x00800090:
+                  raise Unsupp('long multiply (umull/smull/umlal/smlal)')
+              elif cls == 0 and (w & 0x90) == 0x90:
+                  body = halfword(w, addr)
+              elif cls in (0, 1):
+                  body, end = dataproc(w, cls, addr)
+              elif cls in (2, 3):
+                  body, end = single(w, cls, addr)
+              elif cls == 4:
+                  body, end = block(w, addr)
+              elif cls == 5:
+                  body, end = branch(w, addr, lo, hix)
+              else:
+                  raise Unsupp('vfp/coproc/svc: ' + mnem(w, addr))
+              if cc != 14:
+                  body = 'if (%s) { %s }' % (CONDC[cc], body)
+                  end = False
+              return body, end
+
+          def scan(lo, hix, want):
+              reasons = []
+              lines = []
+              last_end = False
+              n = (hix - lo) // 4
+              words = struct.unpack_from('<%dI' % n, code, lo - TEXT_LO)
+              for i, w in enumerate(words):
+                  a = lo + 4 * i
+                  try:
+                      body, end = xlat(w, a, lo, hix)
+                      if want:
+                          lines.append('L_%08x: ; %s' % (a, body))
+                      last_end = end
+                  except Unsupp as e:
+                      reasons.append(str(e))
+                      last_end = False
+              if not reasons and not last_end:
+                  reasons.append('falls off the end of the function')
+              return reasons, lines, n
+
+          # ---------- load function list ----------
+          funcs = []
+          for line in open('export/functions.tsv'):
+              if line.startswith('#') or not line.strip():
+                  continue
+              entry, mode, size, ranges, name = line.rstrip('\n').split('\t')
+              rs = []
+              for part in ranges.split(';'):
+                  a, b = part.split('-')
+                  rs.append((int(a, 16), int(b, 16)))
+              funcs.append((int(entry, 16), mode, rs))
+
+          func_blockers = collections.Counter()
+          instr_blockers = collections.Counter()
+          total_funcs = len(funcs)
+          n_thumb = n_multi = n_single = 0
+          instr_total = instr_ok = 0
+          supported = []
+          sel_lines = {}
+          for entry, mode, rs in funcs:
+              if mode == 'T':
+                  n_thumb += 1
+                  func_blockers['thumb function'] += 1
+                  continue
+              if len(rs) != 1:
+                  n_multi += 1
+                  func_blockers['function split over several ranges'] += 1
+                  continue
+              lo, hi = rs[0]
+              if lo < TEXT_LO or hi >= TEXT_HI or lo % 4 or (hi + 1 - lo) % 4:
+                  func_blockers['odd range'] += 1
+                  continue
+              n_single += 1
+              hix = hi + 1
+              size = hix - lo
+              reasons, lines, n = scan(lo, hix, size <= MAXSIZE)
+              instr_total += n
+              for r in reasons:
+                  instr_blockers[r] += 1
+              instr_ok += n - len([r for r in reasons if r != 'falls off the end of the function'])
+              if reasons:
+                  func_blockers['first blocker: ' + reasons[0]] += 1
+              else:
+                  supported.append((entry, lo, hix))
+                  func_blockers['SUPPORTED'] += 1
+                  if size <= MAXSIZE and size >= MINSIZE:
+                      sel_lines[entry] = lines
+
+          print('scan done in %.0fs' % (time.time() - t0))
+          os.makedirs('reports', exist_ok=True)
+          cand = sorted(e for e in sel_lines)
+          if len(cand) > MAXF:
+              step = len(cand) / float(MAXF)
+              cand = [cand[int(i * step)] for i in range(MAXF)]
+          selected = [(e, lo, hix) for (e, lo, hix) in supported if e in set(cand)]
+          selected.sort()
+
+          with open('reports/translatable_functions.tsv', 'w') as w:
+              w.write('# entry\tsize_bytes\n')
+              for e, lo, hix in supported:
+                  w.write('0x%08x\t%d\n' % (e, hix - lo))
+
+          RT = r'''
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <setjmp.h>
+          #define IMG_LO 0x00100000u
+          #define IMG_LEN 0x00628000u
+          #define SCR_LO 0x00730000u
+          #define SCR_LEN 0x2000u
+          #define RET_ADDR 0x00F00000u
+          #define LIMIT 20000u
+          typedef struct { uint32_t r[16]; uint32_t N, Z, C, V; int status; } CPU;
+          static uint8_t img[IMG_LEN];
+          static uint8_t scr[SCR_LEN];
+          static jmp_buf jb;
+          static int g_unal;
+          static void FAULT(void) __attribute__((noreturn));
+          static void FAULT(void) { longjmp(jb, 1); }
+          static uint8_t *mp(uint32_t a, uint32_t n, int wr) {
+            if (a >= IMG_LO && (uint64_t)a + n <= (uint64_t)IMG_LO + IMG_LEN) {
+              if (wr) FAULT();
+              return img + (a - IMG_LO);
+            }
+            if (a >= SCR_LO && (uint64_t)a + n <= (uint64_t)SCR_LO + SCR_LEN) return scr + (a - SCR_LO);
+            FAULT();
+          }
+          static uint32_t RD32(uint32_t a) { if (a & 3u) g_unal = 1; uint8_t *p = mp(a, 4, 0); return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+          static uint32_t RD16(uint32_t a) { if (a & 1u) g_unal = 1; uint8_t *p = mp(a, 2, 0); return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
+          static uint32_t RD8(uint32_t a) { return *mp(a, 1, 0); }
+          static void WR32(uint32_t a, uint32_t v) { if (a & 3u) g_unal = 1; uint8_t *p = mp(a, 4, 1); p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
+          static void WR16(uint32_t a, uint32_t v) { if (a & 1u) g_unal = 1; uint8_t *p = mp(a, 2, 1); p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+          static void WR8(uint32_t a, uint32_t v) { *mp(a, 1, 1) = (uint8_t)v; }
+          static uint32_t shl_c(uint32_t v, uint32_t n, uint32_t ci, uint32_t *co) {
+            if (n == 0) { *co = ci; return v; }
+            if (n < 32) { *co = (v >> (32 - n)) & 1; return v << n; }
+            if (n == 32) { *co = v & 1; return 0; }
+            *co = 0; return 0;
+          }
+          static uint32_t shr_c(uint32_t v, uint32_t n, uint32_t ci, uint32_t *co) {
+            if (n == 0) { *co = ci; return v; }
+            if (n < 32) { *co = (v >> (n - 1)) & 1; return v >> n; }
+            if (n == 32) { *co = v >> 31; return 0; }
+            *co = 0; return 0;
+          }
+          static uint32_t sar_c(uint32_t v, uint32_t n, uint32_t ci, uint32_t *co) {
+            if (n == 0) { *co = ci; return v; }
+            if (n < 32) { *co = (v >> (n - 1)) & 1; return (uint32_t)((int32_t)v >> n); }
+            *co = v >> 31; return (v >> 31) ? 0xFFFFFFFFu : 0u;
+          }
+          static uint32_t ror_c(uint32_t v, uint32_t n, uint32_t ci, uint32_t *co) {
+            if (n == 0) { *co = ci; return v; }
+            uint32_t a = n & 31u;
+            if (a == 0) { *co = v >> 31; return v; }
+            *co = (v >> (a - 1)) & 1; return (v >> a) | (v << (32 - a));
+          }
+          static uint32_t rrx_c(uint32_t v, uint32_t ci, uint32_t *co) { *co = v & 1; return (ci << 31) | (v >> 1); }
+          #define SHL(v, n) ({ uint32_t d_; shl_c((v), (n), 0, &d_); })
+          #define SHR(v, n) ({ uint32_t d_; shr_c((v), (n), 0, &d_); })
+          #define SAR(v, n) ({ uint32_t d_; sar_c((v), (n), 0, &d_); })
+          #define ROR(v, n) ({ uint32_t d_; ror_c((v), (n), 0, &d_); })
+          #define RRXC(v, cin) ({ uint32_t d_; rrx_c((v), (cin), &d_); })
+          typedef void (*fn_t)(CPU *);
+          typedef struct { uint32_t addr; fn_t fn; } ent_t;
+          '''
+          MAIN = r'''
+          #define NTABLE ((int)(sizeof(table) / sizeof(table[0])))
+          int main(int argc, char **argv) {
+            FILE *f = fopen(argv[1], "rb");
+            if (!f) return 2;
+            if (fread(img, 1, IMG_LEN, f) != IMG_LEN) return 3;
+            fclose(f);
+            FILE *vf = fopen(argv[2], "rb");
+            FILE *of = fopen(argv[3], "wb");
+            if (!vf || !of) return 4;
+            uint32_t rec[18];
+            static CPU c;
+            while (fread(rec, 4, 18, vf) == 18) {
+              fn_t fn = 0;
+              for (int i = 0; i < NTABLE; i++) if (table[i].addr == rec[0]) { fn = table[i].fn; break; }
+              for (uint32_t i = 0; i < SCR_LEN; i++) {
+                uint32_t x = i * 2654435761u + rec[17];
+                x ^= x >> 15; x *= 2246822519u; x ^= x >> 13;
+                scr[i] = (uint8_t)x;
+              }
+              memset(&c, 0, sizeof c);
+              for (int i = 0; i < 15; i++) c.r[i] = rec[1 + i];
+              c.N = (rec[16] >> 3) & 1; c.Z = (rec[16] >> 2) & 1; c.C = (rec[16] >> 1) & 1; c.V = rec[16] & 1;
+              g_unal = 0;
+              volatile uint32_t status;
+              if (!fn) status = 4;
+              else if (setjmp(jb) == 0) {
+                fn(&c);
+                status = (uint32_t)c.status;
+                if (status == 0 && c.r[15] != RET_ADDR) status = 2;
+              } else status = 3;
+              uint32_t out[20];
+              memset(out, 0, sizeof out);
+              out[0] = status; out[1] = (uint32_t)g_unal;
+              for (int i = 0; i < 16; i++) out[2 + i] = c.r[i];
+              out[18] = (c.N << 3) | (c.Z << 2) | (c.C << 1) | c.V;
+              fwrite(out, 4, 20, of);
+              uint64_t s1 = 0, s2 = 0;
+              for (uint32_t i = 0; i < SCR_LEN; i++) { s1 += scr[i]; s2 += (uint64_t)scr[i] * (i + 1); }
+              fwrite(&s1, 8, 1, of); fwrite(&s2, 8, 1, of);
+            }
+            fclose(of);
+            return 0;
+          }
+          '''
+          parts = [RT]
+          for e, lo, hix in selected:
+              parts.append('static void f_%08x(CPU *c) {\n'
+                           ' uint32_t r[16]; memcpy(r, c->r, sizeof r);\n'
+                           ' uint32_t N = c->N, Z = c->Z, C = c->C, V = c->V;\n'
+                           ' uint32_t steps = 0; (void)steps;\n' % e)
+              parts.append('\n'.join(sel_lines[e]))
+              parts.append('\n c->status = 2; goto done;\n done: ;\n'
+                           ' memcpy(c->r, r, sizeof r); c->N = N; c->Z = Z; c->C = C; c->V = V;\n}\n')
+          parts.append('static ent_t table[] = {\n')
+          for e, lo, hix in selected:
+              parts.append(' { 0x%08xu, f_%08x },\n' % (e, e))
+          parts.append('};\n')
+          parts.append(MAIN)
+          open('gen.c', 'w').write('\n'.join(parts))
+          print('generated C for %d functions (%d bytes)' % (len(selected), os.path.getsize('gen.c')))
+          sys.stdout.flush()
+
+          t1 = time.time()
+          cp = subprocess.run(['gcc', '-O1', '-w', '-o', 'harness', 'gen.c', '-lm'],
+                              capture_output=True, text=True)
+          if cp.returncode != 0:
+              print('COMPILE FAILED')
+              print(cp.stderr[:4000])
+              sys.exit(1)
+          print('compiled in %.0fs' % (time.time() - t1))
+
+          # ---------- test vectors ----------
+          def rand_val(rng):
+              x = rng.random()
+              if x < 0.15:
+                  return rng.choice([0, 1, 2, 3, 0xFFFFFFFF, 0x80000000, 0x7FFFFFFF])
+              if x < 0.40:
+                  return rng.randint(-8, 64) & 0xFFFFFFFF
+              if x < 0.65:
+                  return rng.getrandbits(32)
+              return SCR_BASE + rng.randrange(0, 0xF00 // 4) * 4
+
+          trials = []
+          vec = bytearray()
+          for e, lo, hix in selected:
+              for t in range(TRIALS):
+                  rng = random.Random(e * 7919 + t)
+                  regs = [rand_val(rng) for _ in range(13)] + [SP_INIT, RET_ADDR]
+                  flags = rng.randrange(16)
+                  seed = rng.getrandbits(32)
+                  trials.append((e, regs, flags, seed))
+                  vec += struct.pack('<I15III', e, *regs, flags, seed)
+          open('vectors.bin', 'wb').write(vec)
+          subprocess.run(['./harness', 'code.bin', 'vectors.bin', 'results.bin'], check=True, timeout=1800)
+          res = list(struct.iter_unpack('<20IQQ', open('results.bin', 'rb').read()))
+          assert len(res) == len(trials), (len(res), len(trials))
+          print('C harness done, %d trials' % len(res))
+          sys.stdout.flush()
+
+          # ---------- Unicorn reference ----------
+          mu = Uc(UC_ARCH_ARM, UC_MODE_ARM)
+          cpu_note = 'arm1176'
+          try:
+              mu.ctl_set_cpu_model(A.UC_CPU_ARM_1176)
+          except Exception as ex:
+              cpu_note = 'default model (could not select arm1176: %s)' % ex
+          mu.mem_map(TEXT_LO, CODE_LEN, UC_PROT_READ | UC_PROT_EXEC)
+          mu.mem_write(TEXT_LO, code)
+          mu.mem_map(SCR_BASE, SCR_SIZE, UC_PROT_ALL)
+          RR = [getattr(A, 'UC_ARM_REG_R%d' % i) for i in range(13)]
+          IDX = np.arange(SCR_SIZE, dtype=np.uint32)
+          WTS = np.arange(1, SCR_SIZE + 1, dtype=np.uint64)
+
+          def scratch(seed):
+              x = IDX * np.uint32(2654435761) + np.uint32(seed)
+              x = x ^ (x >> np.uint32(15))
+              x = x * np.uint32(2246822519)
+              x = x ^ (x >> np.uint32(13))
+              return (x & np.uint32(255)).astype(np.uint8).tobytes()
+
+          def run_uc(entry, regs, flags, seed):
+              mu.mem_write(SCR_BASE, scratch(seed))
+              for i in range(13):
+                  mu.reg_write(RR[i], regs[i])
+              mu.reg_write(A.UC_ARM_REG_SP, regs[13])
+              mu.reg_write(A.UC_ARM_REG_LR, regs[14])
+              mu.reg_write(A.UC_ARM_REG_CPSR, 0x10 | (flags << 28))
+              status = 0
+              try:
+                  mu.emu_start(entry, RET_ADDR, count=2000000)
+              except UcError:
+                  status = 3
+              else:
+                  if mu.reg_read(A.UC_ARM_REG_PC) != RET_ADDR:
+                      status = 1
+              out = [mu.reg_read(RR[i]) for i in range(13)]
+              out.append(mu.reg_read(A.UC_ARM_REG_SP))
+              out.append(mu.reg_read(A.UC_ARM_REG_LR))
+              fl = (mu.reg_read(A.UC_ARM_REG_CPSR) >> 28) & 15
+              b = np.frombuffer(bytes(mu.mem_read(SCR_BASE, SCR_SIZE)), dtype=np.uint8).astype(np.uint64)
+              return status, out, fl, int(b.sum()), int((b * WTS).sum())
+
+          per = collections.defaultdict(lambda: collections.Counter())
+          first_diff = {}
+          skips = collections.Counter()
+          both_fault = 0
+          compared = matched = mismatched = 0
+          for idx, (entry, regs, flags, seed) in enumerate(trials):
+              rec = res[idx]
+              cstat, unal = rec[0], rec[1]
+              if unal:
+                  skips['unaligned access'] += 1
+                  per[entry]['skip'] += 1
+                  continue
+              if cstat in (1, 2, 4):
+                  skips['C side: ' + {1: 'step limit', 2: 'bad return / fell off end', 4: 'function missing'}[cstat]] += 1
+                  per[entry]['skip'] += 1
+                  continue
+              ust, uregs, ufl, us1, us2 = run_uc(entry, regs, flags, seed)
+              if ust == 1:
+                  skips['unicorn instruction limit'] += 1
+                  per[entry]['skip'] += 1
+                  continue
+              if cstat == 3 and ust == 3:
+                  both_fault += 1
+                  per[entry]['fault'] += 1
+                  continue
+              compared += 1
+              diffs = []
+              if cstat != ust:
+                  diffs.append('fault disagreement: C=%s unicorn=%s' % ('fault' if cstat == 3 else 'ok', 'fault' if ust == 3 else 'ok'))
+              else:
+                  names = ['r%d' % i for i in range(13)] + ['sp', 'lr']
+                  for i in range(15):
+                      if rec[2 + i] != uregs[i]:
+                          diffs.append('%s: C=0x%08x unicorn=0x%08x' % (names[i], rec[2 + i], uregs[i]))
+                  if rec[18] != ufl:
+                      diffs.append('flags NZCV: C=%s unicorn=%s' % (format(rec[18], '04b'), format(ufl, '04b')))
+                  if rec[20] != us1 or rec[21] != us2:
+                      diffs.append('scratch memory differs')
+              if diffs:
+                  mismatched += 1
+                  per[entry]['mismatch'] += 1
+                  if entry not in first_diff:
+                      first_diff[entry] = (diffs[:8], regs, flags)
+              else:
+                  matched += 1
+                  per[entry]['match'] += 1
+
+          passed = failed = inconclusive = 0
+          failing = []
+          for e, lo, hix in selected:
+              c = per[e]
+              if c['mismatch']:
+                  failed += 1
+                  failing.append(e)
+              elif c['match'] >= 3:
+                  passed += 1
+              else:
+                  inconclusive += 1
+
+          out = []
+          def p(s=''):
+              out.append(s)
+          p('Unicorn CPU: %s' % cpu_note)
+          p('=== coverage of the instruction set (single-range ARM functions) ===')
+          p('functions in export: %d (thumb %d, multi-range %d, single-range ARM %d)' % (total_funcs, n_thumb, n_multi, n_single))
+          p('single-range ARM functions fully translatable: %d' % len(supported))
+          p('instructions supported: %d of %d (%.1f%%)' % (instr_ok, instr_total, 100.0 * instr_ok / max(instr_total, 1)))
+          p('=== test run ===')
+          p('functions tested: %d, trials: %d' % (len(selected), len(trials)))
+          p('compared: %d, matched: %d, MISMATCHED: %d, both faulted: %d' % (compared, matched, mismatched, both_fault))
+          for k, v in skips.most_common():
+              p('skipped (%s): %d' % (k, v))
+          p('functions: PASS %d, FAIL %d, inconclusive (fewer than 3 comparable trials) %d' % (passed, failed, inconclusive))
+          p('=== why single-range functions are not translatable yet (first blocker per function) ===')
+          for k, v in func_blockers.most_common(30):
+              p('  %d  %s' % (v, k))
+          p('=== unsupported instructions, counted per instruction ===')
+          for k, v in instr_blockers.most_common(40):
+              p('  %d  %s' % (v, k))
+          p('=== first mismatch for up to 15 failing functions ===')
+          for e in failing[:15]:
+              d, regs, fl = first_diff[e]
+              p('function 0x%08x: %s' % (e, '; '.join(d)))
+              p('   inputs r0-r3: %s flags NZCV=%s' % (' '.join('%08x' % x for x in regs[:4]), format(fl, '04b')))
+          open('reports/translate_summary.txt', 'w').write('\n'.join(out) + '\n')
+
+          with open('reports/mismatch_excerpts.txt', 'w') as w:
+              w.write('Short disassembly excerpts of up to 3 failing functions (derived from the game; keep private)\n')
+              for e in failing[:3]:
+                  lo = [x for x in selected if x[0] == e][0][1]
+                  hix = [x for x in selected if x[0] == e][0][2]
+                  w.write('\n== 0x%08x ==\n' % e)
+                  shown = 0
+                  for i in range((hix - lo) // 4):
+                      a = lo + 4 * i
+                      word = struct.unpack_from('<I', code, a - TEXT_LO)[0]
+                      for ins in md.disasm(struct.pack('<I', word), a):
+                          w.write('%08x  %08x  %s %s\n' % (a, word, ins.mnemonic, ins.op_str))
+                      shown += 1
+                      if shown >= 25:
+                          break
+          print('done in %.0fs' % (time.time() - t0))
+          PY
+
+      - name: Run translator and tests
+        env:
+          TRIALS: ${{ inputs.trials }}
+          MAXF: ${{ inputs.max_functions }}
+        run: python3 tr.py
+
+      - name: Show reports
+        if: always()
+        run: |
+          echo "=== translate_summary ==="
+          cat reports/translate_summary.txt || true
+          echo "=== mismatch excerpts (first 80 lines) ==="
+          head -80 reports/mismatch_excerpts.txt || true
+
+      - name: Remove translated code from the runner
+        if: always()
+        run: rm -f gen.c harness code.bin vectors.bin results.bin
+
+      - name: Upload reports (text only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: albw-translate1
+          path: reports/*
+          retention-days: 7
+
