@@ -1,0 +1,250 @@
+name: PS4 N64 probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DOTNET_ROLL_FORWARD: Major
+      DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
+    steps:
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install clang and lld
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld make
+          clang --version
+
+      - name: Download OpenOrbis toolchain release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p tc
+          gh release view --repo OpenOrbis/OpenOrbis-PS4-Toolchain --json tagName,assets \
+            --jq '.tagName, (.assets[].name)'
+          gh release download --repo OpenOrbis/OpenOrbis-PS4-Toolchain --dir tc --pattern '*'
+          ls -l tc
+
+      - name: Unpack toolchain
+        run: |
+          set -euo pipefail
+          cd tc
+          F="$(ls | grep -i linux | head -n 1 || true)"
+          if [ -z "$F" ]; then
+            F="$(ls | grep -iE '\.(zip|tar\.gz|tgz)$' | head -n 1)"
+          fi
+          echo "Using archive: $F"
+          mkdir -p ../oo
+          case "$F" in
+            *.zip) unzip -q "$F" -d ../oo ;;
+            *) tar -xf "$F" -C ../oo ;;
+          esac
+          cd ..
+          BIN="$(find oo -type d -path '*/bin/linux' | head -n 1)"
+          echo "tool dir: $BIN"
+          ROOT="$(cd "$(dirname "$(dirname "$BIN")")" && pwd)"
+          echo "OO_PS4_TOOLCHAIN=$ROOT" >> "$GITHUB_ENV"
+          chmod -R +x "$ROOT"/bin/linux/ || true
+          ls "$ROOT"
+
+      - name: Create project from hello_world sample
+        run: |
+          set -euo pipefail
+          cp -r "$OO_PS4_TOOLCHAIN/samples/hello_world" hello_world
+          sed -i 's|^TITLE .*|TITLE       := N64 Probe|' hello_world/Makefile
+          sed -i 's|^TITLE_ID .*|TITLE_ID    := BREW00099|' hello_world/Makefile
+          sed -i 's|^CONTENT_ID .*|CONTENT_ID  := IV0000-BREW00099_00-N64PROBE00000000|' hello_world/Makefile
+          head -6 hello_world/Makefile
+          find hello_world -type f | sort | head -40
+
+      - name: Write probe source
+        run: |
+          cat > probe.src <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <errno.h>
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          extern unsigned long sceKernelGetProcessTime(void);
+          extern int sceKernelMmap(void *addr, unsigned long len, int prot, int flags, int fd, long off, void **res);
+          extern int sceKernelMprotect(void *addr, unsigned long len, int prot);
+          extern void *mmap(void *addr, unsigned long len, int prot, int flags, int fd, long off);
+          extern int mprotect(void *addr, unsigned long len, int prot);
+          #ifdef __cplusplus
+          }
+          #endif
+
+          #define P_R 1
+          #define P_W 2
+          #define P_X 4
+          #define F_PRIVATE 0x0002
+          #define F_ANON 0x1000
+
+          static const char *PATHS[] = {
+            "/data/n64probe.txt", "/mnt/usb0/n64probe.txt", "/mnt/usb1/n64probe.txt"
+          };
+
+          static void say(const char *fmt, ...) {
+            char buf[512];
+            va_list ap;
+            va_start(ap, fmt);
+            vsnprintf(buf, sizeof buf, fmt, ap);
+            va_end(ap);
+            printf("%s", buf);
+            for (int i = 0; i < 3; i++) {
+              FILE *f = fopen(PATHS[i], "a");
+              if (f) { fputs(buf, f); fclose(f); }
+            }
+          }
+
+          static void fill(void *mem) {
+            static const unsigned char code[] = { 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3 };
+            memcpy(mem, code, sizeof code);
+          }
+
+          static void run(void *mem, const char *label) {
+            say("  %s: calling generated code at %p ...\n", label, mem);
+            int (*fn)(void) = (int (*)(void))mem;
+            int v = fn();
+            say("  %s: returned %d (%s)\n", label, v, v == 42 ? "OK" : "WRONG");
+          }
+
+          static void test_a(void) {
+            say("[A] mmap(RWX)\n");
+            void *p = mmap(NULL, 4096, P_R | P_W | P_X, F_PRIVATE | F_ANON, -1, 0);
+            if (p == (void *)-1 || p == NULL) {
+              say("  mmap failed (errno %d)\n", errno);
+              return;
+            }
+            say("  mapped at %p\n", p);
+            fill(p);
+            run(p, "A");
+          }
+
+          static void test_b(void) {
+            say("[B] sceKernelMmap(RWX)\n");
+            void *p = NULL;
+            int rc = sceKernelMmap(NULL, 4096, P_R | P_W | P_X, F_PRIVATE | F_ANON, -1, 0, &p);
+            say("  rc=0x%x p=%p\n", rc, p);
+            if (rc == 0 && p) {
+              fill(p);
+              run(p, "B");
+            }
+          }
+
+          static void test_c(void) {
+            say("[C] map RW, write code, then protect as RX\n");
+            void *p = mmap(NULL, 4096, P_R | P_W, F_PRIVATE | F_ANON, -1, 0);
+            if (p == (void *)-1 || p == NULL) {
+              say("  mmap(RW) failed (errno %d)\n", errno);
+              return;
+            }
+            fill(p);
+            int rc = mprotect(p, 4096, P_R | P_X);
+            say("  mprotect rc=%d errno=%d\n", rc, errno);
+            if (rc != 0) {
+              rc = sceKernelMprotect(p, 4096, P_R | P_X);
+              say("  sceKernelMprotect rc=0x%x\n", rc);
+            }
+            if (rc == 0) run(p, "C");
+          }
+
+          static volatile uint64_t g_sink;
+          static volatile double g_fsink;
+
+          static void bench(void) {
+            say("[bench]\n");
+            unsigned long t0, t1;
+
+            uint32_t x = 2463534242u;
+            uint64_t acc = 0;
+            t0 = sceKernelGetProcessTime();
+            for (uint32_t i = 0; i < 300000000u; i++) {
+              x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+              acc += x;
+            }
+            t1 = sceKernelGetProcessTime();
+            g_sink = acc;
+            say("  integer: 300M xorshift+add iterations in %lu us\n", t1 - t0);
+
+            double a = 1.0, b = 1.0000001;
+            t0 = sceKernelGetProcessTime();
+            for (int i = 0; i < 100000000; i++) {
+              a = a * b + 0.5;
+              if (a > 1e6) a *= 1e-6;
+            }
+            t1 = sceKernelGetProcessTime();
+            g_fsink = a;
+            say("  float: 100M multiply-add iterations in %lu us\n", t1 - t0);
+
+            size_t n = 32u * 1024u * 1024u;
+            unsigned char *s = (unsigned char *)malloc(n);
+            unsigned char *d = (unsigned char *)malloc(n);
+            if (s && d) {
+              memset(s, 1, n);
+              memset(d, 2, n);
+              t0 = sceKernelGetProcessTime();
+              for (int i = 0; i < 20; i++) memcpy(d, s, n);
+              t1 = sceKernelGetProcessTime();
+              say("  memory: 20 x 32 MB memcpy in %lu us\n", t1 - t0);
+            } else {
+              say("  memory: malloc of 2 x 32 MB failed\n");
+            }
+          }
+
+          int main(void) {
+            say("=== N64 probe v1 ===\n");
+            say("process time at start: %lu us\n", sceKernelGetProcessTime());
+            test_a();
+            test_b();
+            test_c();
+            bench();
+            say("=== done ===\n");
+            return 0;
+          }
+          EOF
+
+      - name: Put probe into the project
+        run: |
+          set -eu
+          SRC="$(grep -rlE '\bmain[[:space:]]*\(' hello_world --include='*.c' --include='*.cpp' --include='*.cc' --include='*.cxx' 2>/dev/null | head -n 1 || true)"
+          if [ -z "$SRC" ]; then
+            echo "::error::No source file containing main( was found. Project files:"
+            find hello_world -type f | sort
+            exit 1
+          fi
+          echo "Replacing: $SRC"
+          cp probe.src "$SRC"
+
+      - name: Build
+        run: |
+          set -euxo pipefail
+          make -C hello_world
+
+      - name: Find outputs
+        run: |
+          find hello_world -name '*.pkg' -o -name 'eboot.bin' -o -name '*.gp4' | sort
+          mkdir -p out
+          find hello_world -name '*.pkg' -exec cp {} out/ \;
+          ls -l out
+
+      - name: Upload PKG
+        uses: actions/upload-artifact@v4
+        with:
+          name: n64probe-pkg
+          path: out/*.pkg
+          if-no-files-found: error
+          retention-days: 7
+
